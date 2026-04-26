@@ -1,5 +1,6 @@
 # ESP-IDF build artifacts
 build/
+managed_components/
 
 # Local IDE/editor files
 .vscode/

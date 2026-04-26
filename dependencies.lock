@@ -6,14 +6,12 @@ dependencies:
       type: local
     version: 0.5.3
   espressif/esp_audio_codec:
-    component_hash: af4663830bc73eca58febcc34a976d003465e78ed57458aa00a14b231e392ca1
     dependencies:
     - name: idf
-      require: private
       version: '>=4.4'
     source:
-      registry_url: https://components.espressif.com/
-      type: service
+      path: components\esp_audio_codec
+      type: local
     version: 2.4.1
   espressif/esp_codec_dev:
     dependencies: []
@@ -93,6 +91,6 @@ direct_dependencies:
 - waveshare/esp32_s3_touch_amoled_1_75
 - waveshare/esp_lcd_sh8601
 - waveshare/esp_lcd_touch_cst9217
-manifest_hash: 89f79cb23ca98323bffc50084ca6f863b9acda7f4535ed9fd42fe4d3df83ef7d
+manifest_hash: 49c7571fcf4837c2b533b91fd1895d82bde6ff074da31366672cd244ff0b6690
 target: esp32s3
 version: 3.0.0
