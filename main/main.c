@@ -39,6 +39,9 @@
 #define TOUCH_DEBOUNCE_MS 300
 #define MP3_DEC_IN_CHUNK 1024
 #define MP3_DEC_OUT_CHUNK 4096
+#define MP3_DEC_MAX_OUT_CHUNK (32 * 1024)
+#define AUDIO_PLAYBACK_TASK_STACK_SIZE 16384
+#define AUDIO_OUTPUT_VOLUME_PERCENT 85
 
 static const char *TAG = "SLIDESHOW";
 
@@ -69,6 +72,8 @@ static bool s_audio_initialized = false;
 static bool s_audio_decoders_registered = false;
 static bool s_audio_playing = false;
 static TickType_t s_last_touch_tick = 0;
+static TaskHandle_t s_audio_task_handle = NULL;
+static size_t s_pending_audio_index = SIZE_MAX;
 
 static esp_err_t mount_sdcard_stable(void)
 {
@@ -924,13 +929,6 @@ static void play_image_sound(size_t img_idx)
             return;
         }
 
-        if (s_audio_playing) {
-            ESP_LOGI(TAG, "Audio is already playing, ignoring touch");
-            return;
-        }
-
-        s_audio_playing = true;
-
         ESP_LOGI(TAG, "Playing MP3 for image: %s (%u bytes)", 
                  s_images[img_idx].file_name, 
                  (unsigned)s_images[img_idx].mp3_size);
@@ -946,15 +944,17 @@ static void play_image_sound(size_t img_idx)
         esp_audio_err_t dec_ret = esp_audio_simple_dec_open(&dec_cfg, &decoder);
         if (dec_ret != ESP_AUDIO_ERR_OK || decoder == NULL) {
             ESP_LOGW(TAG, "Failed to open MP3 decoder: %d", (int)dec_ret);
-            s_audio_playing = false;
             return;
         }
 
-        uint8_t *out_buf = (uint8_t *)malloc(MP3_DEC_OUT_CHUNK);
+        size_t out_buf_size = MP3_DEC_OUT_CHUNK;
+        uint8_t *out_buf = (uint8_t *)heap_caps_malloc(out_buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (out_buf == NULL) {
+            out_buf = (uint8_t *)malloc(out_buf_size);
+        }
         if (out_buf == NULL) {
             ESP_LOGW(TAG, "No memory for MP3 decode output buffer");
             esp_audio_simple_dec_close(decoder);
-            s_audio_playing = false;
             return;
         }
 
@@ -975,18 +975,30 @@ static void play_image_sound(size_t img_idx)
             while (raw.len > 0) {
                 esp_audio_simple_dec_out_t out = {
                     .buffer = out_buf,
-                    .len = MP3_DEC_OUT_CHUNK,
+                    .len = out_buf_size,
                 };
 
                 dec_ret = esp_audio_simple_dec_process(decoder, &raw, &out);
                 if (dec_ret == ESP_AUDIO_ERR_BUFF_NOT_ENOUGH) {
-                    uint8_t *new_out = (uint8_t *)realloc(out_buf, out.needed_size);
+                    if (out.needed_size > MP3_DEC_MAX_OUT_CHUNK) {
+                        ESP_LOGW(TAG, "MP3 output buffer request too large: %u", (unsigned)out.needed_size);
+                        dec_ret = ESP_AUDIO_ERR_MEM_LACK;
+                        break;
+                    }
+
+                    uint8_t *new_out = (uint8_t *)heap_caps_malloc(out.needed_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                    if (new_out == NULL) {
+                        new_out = (uint8_t *)malloc(out.needed_size);
+                    }
                     if (new_out == NULL) {
                         ESP_LOGW(TAG, "Failed to grow MP3 output buffer to %u", (unsigned)out.needed_size);
                         dec_ret = ESP_AUDIO_ERR_MEM_LACK;
                         break;
                     }
+
+                    free(out_buf);
                     out_buf = new_out;
+                    out_buf_size = out.needed_size;
                     continue;
                 }
 
@@ -1016,7 +1028,7 @@ static void play_image_sound(size_t img_idx)
                             break;
                         }
 
-                        esp_codec_dev_set_out_vol(s_speaker_codec_dev, 50);
+                        esp_codec_dev_set_out_vol(s_speaker_codec_dev, AUDIO_OUTPUT_VOLUME_PERCENT);
                         codec_opened = true;
                         ESP_LOGI(TAG, "MP3 decode info: %u Hz, %u-bit, %u ch",
                                  (unsigned)dec_info.sample_rate,
@@ -1060,7 +1072,23 @@ static void play_image_sound(size_t img_idx)
         } else {
             ESP_LOGW(TAG, "MP3 playback produced no PCM output");
         }
+    }
+}
 
+static void audio_playback_task(void *arg)
+{
+    (void)arg;
+
+    while (1) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        size_t img_idx = s_pending_audio_index;
+        if (img_idx >= s_image_count) {
+            s_audio_playing = false;
+            continue;
+        }
+
+        play_image_sound(img_idx);
         s_audio_playing = false;
     }
 }
@@ -1106,6 +1134,23 @@ static esp_err_t audio_init(void)
     }
 
     s_audio_initialized = true;
+
+    if (s_audio_task_handle == NULL) {
+        BaseType_t ok = xTaskCreatePinnedToCore(audio_playback_task,
+                                                "audio_playback",
+                                                AUDIO_PLAYBACK_TASK_STACK_SIZE,
+                                                NULL,
+                                                tskIDLE_PRIORITY + 2,
+                                                &s_audio_task_handle,
+                                                0);
+        if (ok != pdPASS) {
+            s_audio_task_handle = NULL;
+            ESP_LOGE(TAG, "Failed to start audio playback task");
+            s_audio_initialized = false;
+            return ESP_FAIL;
+        }
+    }
+
     return ESP_OK;
 }
 
@@ -1129,8 +1174,21 @@ static void on_image_touched(lv_event_t *event)
                 return;
             }
         }
+
+        if (s_audio_playing) {
+            ESP_LOGI(TAG, "Audio is already playing, ignoring touch");
+            return;
+        }
+
+        if (s_audio_task_handle == NULL) {
+            ESP_LOGW(TAG, "Audio playback task is not available");
+            return;
+        }
+
         ESP_LOGI(TAG, "Screen touched, playing image sound");
-        play_image_sound(s_current_index);
+        s_audio_playing = true;
+        s_pending_audio_index = s_current_index;
+        xTaskNotifyGive(s_audio_task_handle);
     }
 }
 
