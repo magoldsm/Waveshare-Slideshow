@@ -1,0 +1,87 @@
+dependencies:
+  espressif/cmake_utilities:
+    dependencies: []
+    source:
+      path: ..\managed_components\espressif__cmake_utilities
+      type: local
+    version: 0.5.3
+  espressif/esp_codec_dev:
+    dependencies: []
+    source:
+      path: ..\managed_components\espressif__esp_codec_dev
+      type: local
+    version: 1.5.7
+  espressif/esp_io_expander:
+    dependencies: []
+    source:
+      path: ..\managed_components\espressif__esp_io_expander
+      type: local
+    version: 1.2.1
+  espressif/esp_io_expander_tca9554:
+    dependencies: []
+    source:
+      path: ..\managed_components\espressif__esp_io_expander_tca9554
+      type: local
+    version: 2.0.3
+  espressif/esp_lcd_panel_io_additions:
+    dependencies: []
+    source:
+      path: ..\managed_components\espressif__esp_lcd_panel_io_additions
+      type: local
+    version: 1.0.1
+  espressif/esp_lcd_touch:
+    dependencies: []
+    source:
+      path: ..\managed_components\espressif__esp_lcd_touch
+      type: local
+    version: 1.2.1
+  espressif/esp_lvgl_port:
+    dependencies: []
+    source:
+      path: ..\managed_components\espressif__esp_lvgl_port
+      type: local
+    version: 2.7.2
+  idf:
+    source:
+      type: idf
+    version: 6.0.0
+  lvgl/lvgl:
+    dependencies: []
+    source:
+      path: ..\managed_components\lvgl__lvgl
+      type: local
+    version: 9.3.0
+  waveshare/esp32_s3_touch_amoled_1_75:
+    dependencies: []
+    source:
+      path: ..\managed_components\waveshare__esp32_s3_touch_amoled_1_75
+      type: local
+    version: 1.0.2
+  waveshare/esp_lcd_sh8601:
+    dependencies: []
+    source:
+      path: ..\managed_components\waveshare__esp_lcd_sh8601
+      type: local
+    version: 1.0.2
+  waveshare/esp_lcd_touch_cst9217:
+    dependencies: []
+    source:
+      path: ..\managed_components\waveshare__esp_lcd_touch_cst9217
+      type: local
+    version: 1.0.4
+direct_dependencies:
+- espressif/cmake_utilities
+- espressif/esp_codec_dev
+- espressif/esp_io_expander
+- espressif/esp_io_expander_tca9554
+- espressif/esp_lcd_panel_io_additions
+- espressif/esp_lcd_touch
+- espressif/esp_lvgl_port
+- idf
+- lvgl/lvgl
+- waveshare/esp32_s3_touch_amoled_1_75
+- waveshare/esp_lcd_sh8601
+- waveshare/esp_lcd_touch_cst9217
+manifest_hash: b0f52e1767856fa8ebe684ec122c8cc9a9c5b9d925754be87ed87916a8abe65a
+target: esp32s3
+version: 3.0.0
