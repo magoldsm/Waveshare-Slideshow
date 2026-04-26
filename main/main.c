@@ -16,6 +16,7 @@
 #include "bsp/display.h"
 #include "esp_lvgl_port_touch.h"
 #include "lvgl.h"
+#include "draw/lv_image_decoder_private.h"
 
 #define MAX_IMAGES 256
 #define IMAGE_CHANGE_MS 5000
@@ -42,8 +43,10 @@ typedef struct {
     uint16_t img_w;
     uint16_t img_h;
     uint32_t display_scale;
+    lv_color_t backdrop_color;
 } image_entry_t;
 
+static lv_obj_t *s_screen_obj;
 static lv_obj_t *s_image_obj;
 static lv_obj_t *s_status_label;
 static image_entry_t s_images[MAX_IMAGES];
@@ -206,6 +209,177 @@ static uint32_t compute_fill_scale(uint16_t img_w, uint16_t img_h)
     return lvgl_scale;
 }
 
+static bool decode_rgb_from_draw_buf(const lv_draw_buf_t *buf, uint32_t x, uint32_t y,
+                                     uint8_t *out_r, uint8_t *out_g, uint8_t *out_b)
+{
+    if (buf == NULL || out_r == NULL || out_g == NULL || out_b == NULL) {
+        return false;
+    }
+
+    lv_color_format_t cf = (lv_color_format_t)buf->header.cf;
+    const uint8_t *ptr = (const uint8_t *)lv_draw_buf_goto_xy(buf, x, y);
+    if (ptr == NULL) {
+        return false;
+    }
+
+    if (cf == LV_COLOR_FORMAT_RGB888) {
+        // lv_color_t byte order is B, G, R
+        *out_b = ptr[0];
+        *out_g = ptr[1];
+        *out_r = ptr[2];
+        return true;
+    }
+
+    if (cf == LV_COLOR_FORMAT_ARGB8888 ||
+        cf == LV_COLOR_FORMAT_ARGB8888_PREMULTIPLIED ||
+        cf == LV_COLOR_FORMAT_XRGB8888) {
+        const lv_color32_t *c32 = (const lv_color32_t *)ptr;
+        *out_r = c32->red;
+        *out_g = c32->green;
+        *out_b = c32->blue;
+        return true;
+    }
+
+    if (cf == LV_COLOR_FORMAT_RGB565 || cf == LV_COLOR_FORMAT_RGB565_SWAPPED) {
+        uint16_t c = *((const uint16_t *)ptr);
+        if (cf == LV_COLOR_FORMAT_RGB565_SWAPPED) {
+            c = lv_color_swap_16(c);
+        }
+        uint8_t r5 = (uint8_t)((c >> 11) & 0x1F);
+        uint8_t g6 = (uint8_t)((c >> 5) & 0x3F);
+        uint8_t b5 = (uint8_t)(c & 0x1F);
+        *out_r = (uint8_t)((r5 * 255) / 31);
+        *out_g = (uint8_t)((g6 * 255) / 63);
+        *out_b = (uint8_t)((b5 * 255) / 31);
+        return true;
+    }
+
+    return false;
+}
+
+static lv_color_t compute_edge_dominant_color(const void *src)
+{
+    enum { COLOR_BINS_PER_CHANNEL = 6, COLOR_BIN_COUNT = 216 };
+
+    lv_image_decoder_dsc_t dsc;
+    lv_memzero(&dsc, sizeof(dsc));
+    if (lv_image_decoder_open(&dsc, src, NULL) != LV_RESULT_OK) {
+        return lv_color_black();
+    }
+
+    uint32_t img_w = dsc.header.w;
+    uint32_t img_h = dsc.header.h;
+    if (img_w == 0 || img_h == 0) {
+        lv_image_decoder_close(&dsc);
+        return lv_color_black();
+    }
+
+    uint32_t min_side = (img_w < img_h) ? img_w : img_h;
+    uint32_t edge_band = min_side / 14;
+    if (edge_band < 2) edge_band = 2;
+    uint32_t sample_step = min_side / 90;
+    if (sample_step < 1) sample_step = 1;
+
+    uint16_t count[COLOR_BIN_COUNT] = {0};
+    uint32_t sum_r[COLOR_BIN_COUNT] = {0};
+    uint32_t sum_g[COLOR_BIN_COUNT] = {0};
+    uint32_t sum_b[COLOR_BIN_COUNT] = {0};
+
+    // lodepng (PNG) fully decodes the image into dsc.decoded during open(), so
+    // get_area() returns LV_RESULT_INVALID immediately and the loop never runs.
+    // TJPGD (JPEG) decodes incrementally — dsc.decoded is NULL after open().
+    // Handle both cases.
+    if (dsc.decoded != NULL) {
+        // Full image already decoded (e.g. PNG via lodepng) — iterate directly.
+        const lv_draw_buf_t *buf = dsc.decoded;
+        for (uint32_t gy = 0; gy < img_h; gy++) {
+            bool edge_y = (gy < edge_band) || (gy + edge_band >= img_h);
+            for (uint32_t gx = 0; gx < img_w; gx++) {
+                bool edge_x = (gx < edge_band) || (gx + edge_band >= img_w);
+                if (!(edge_x || edge_y)) continue;
+                if ((gx % sample_step) != 0 || (gy % sample_step) != 0) continue;
+
+                uint8_t r = 0, g = 0, b = 0;
+                if (!decode_rgb_from_draw_buf(buf, gx, gy, &r, &g, &b)) continue;
+
+                uint32_t rb = (r * COLOR_BINS_PER_CHANNEL) / 256;
+                uint32_t gb = (g * COLOR_BINS_PER_CHANNEL) / 256;
+                uint32_t bb = (b * COLOR_BINS_PER_CHANNEL) / 256;
+                if (rb >= COLOR_BINS_PER_CHANNEL) rb = COLOR_BINS_PER_CHANNEL - 1;
+                if (gb >= COLOR_BINS_PER_CHANNEL) gb = COLOR_BINS_PER_CHANNEL - 1;
+                if (bb >= COLOR_BINS_PER_CHANNEL) bb = COLOR_BINS_PER_CHANNEL - 1;
+
+                uint32_t idx = rb * COLOR_BINS_PER_CHANNEL * COLOR_BINS_PER_CHANNEL +
+                               gb * COLOR_BINS_PER_CHANNEL + bb;
+                if (count[idx] < 0xFFFF) count[idx]++;
+                sum_r[idx] += r;
+                sum_g[idx] += g;
+                sum_b[idx] += b;
+            }
+        }
+    } else {
+        // Incremental decoder (e.g. JPEG via TJPGD) — use get_area() loop.
+        lv_area_t full_area = {.x1 = 0, .y1 = 0, .x2 = (int32_t)img_w - 1, .y2 = (int32_t)img_h - 1};
+        lv_area_t decoded_area = {.x1 = LV_COORD_MIN, .y1 = LV_COORD_MIN, .x2 = LV_COORD_MIN, .y2 = LV_COORD_MIN};
+
+        while (lv_image_decoder_get_area(&dsc, &full_area, &decoded_area) == LV_RESULT_OK) {
+            const lv_draw_buf_t *buf = dsc.decoded;
+            if (buf == NULL) break;
+
+            uint32_t buf_w = buf->header.w;
+            uint32_t buf_h = buf->header.h;
+            for (uint32_t ly = 0; ly < buf_h; ly++) {
+                uint32_t gy = (uint32_t)decoded_area.y1 + ly;
+                bool edge_y = (gy < edge_band) || (gy + edge_band >= img_h);
+
+                for (uint32_t lx = 0; lx < buf_w; lx++) {
+                    uint32_t gx = (uint32_t)decoded_area.x1 + lx;
+                    bool edge_x = (gx < edge_band) || (gx + edge_band >= img_w);
+                    if (!(edge_x || edge_y)) continue;
+                    if ((gx % sample_step) != 0 || (gy % sample_step) != 0) continue;
+
+                    uint8_t r = 0, g = 0, b = 0;
+                    if (!decode_rgb_from_draw_buf(buf, lx, ly, &r, &g, &b)) continue;
+
+                    uint32_t rb = (r * COLOR_BINS_PER_CHANNEL) / 256;
+                    uint32_t gb = (g * COLOR_BINS_PER_CHANNEL) / 256;
+                    uint32_t bb = (b * COLOR_BINS_PER_CHANNEL) / 256;
+                    if (rb >= COLOR_BINS_PER_CHANNEL) rb = COLOR_BINS_PER_CHANNEL - 1;
+                    if (gb >= COLOR_BINS_PER_CHANNEL) gb = COLOR_BINS_PER_CHANNEL - 1;
+                    if (bb >= COLOR_BINS_PER_CHANNEL) bb = COLOR_BINS_PER_CHANNEL - 1;
+
+                    uint32_t idx = rb * COLOR_BINS_PER_CHANNEL * COLOR_BINS_PER_CHANNEL +
+                                   gb * COLOR_BINS_PER_CHANNEL + bb;
+                    if (count[idx] < 0xFFFF) count[idx]++;
+                    sum_r[idx] += r;
+                    sum_g[idx] += g;
+                    sum_b[idx] += b;
+                }
+            }
+        }
+    }
+
+    lv_image_decoder_close(&dsc);
+
+    uint32_t best_idx = 0;
+    uint16_t best_count = 0;
+    for (uint32_t i = 0; i < COLOR_BIN_COUNT; i++) {
+        if (count[i] > best_count) {
+            best_count = count[i];
+            best_idx = i;
+        }
+    }
+
+    if (best_count == 0) {
+        return lv_color_black();
+    }
+
+    uint8_t r = (uint8_t)(sum_r[best_idx] / best_count);
+    uint8_t g = (uint8_t)(sum_g[best_idx] / best_count);
+    uint8_t b = (uint8_t)(sum_b[best_idx] / best_count);
+    return lv_color_make(r, g, b);
+}
+
 static bool has_ext(const char *name, const char *ext)
 {
     const char *dot = strrchr(name, '.');
@@ -290,6 +464,7 @@ static esp_err_t scan_sdcard_root_images(void)
         s_images[s_image_count].img_w = 0;
         s_images[s_image_count].img_h = 0;
         s_images[s_image_count].display_scale = LV_SCALE_NONE;
+        s_images[s_image_count].backdrop_color = lv_color_black();
 
         s_image_count++;
     }
@@ -457,6 +632,7 @@ static esp_err_t preload_images_into_memory(void)
         s_images[i].img_w = width;
         s_images[i].img_h = height;
         s_images[i].display_scale = compute_fill_scale(width, height);
+        s_images[i].backdrop_color = compute_edge_dominant_color(s_images[i].src);
 #if SLIDESHOW_VERBOSE_LOGS
         if (width > 0 && height > 0) {
             ESP_LOGI(TAG,
@@ -618,13 +794,16 @@ static void update_image_and_status(size_t index)
     const void *image_src = s_images[s_current_index].src;
     bool image_ok = image_src != NULL;
     if (image_ok) {
+        lv_obj_set_style_bg_color(s_screen_obj, s_images[s_current_index].backdrop_color, 0);
+
+        int32_t pivot_x = (s_images[s_current_index].img_w > 0) ? (s_images[s_current_index].img_w / 2) : (lv_obj_get_width(s_image_obj) / 2);
+        int32_t pivot_y = (s_images[s_current_index].img_h > 0) ? (s_images[s_current_index].img_h / 2) : (lv_obj_get_height(s_image_obj) / 2);
+
         lv_image_set_src(s_image_obj, image_src);
         uint32_t scale = s_images[s_current_index].display_scale;
         if (scale == 0) scale = LV_SCALE_NONE;
         lv_image_set_scale(s_image_obj, LV_SCALE_NONE);
         lv_obj_set_style_transform_scale(s_image_obj, (int32_t)scale, LV_PART_MAIN);
-        int32_t pivot_x = (s_images[s_current_index].img_w > 0) ? (s_images[s_current_index].img_w / 2) : (lv_obj_get_width(s_image_obj) / 2);
-        int32_t pivot_y = (s_images[s_current_index].img_h > 0) ? (s_images[s_current_index].img_h / 2) : (lv_obj_get_height(s_image_obj) / 2);
         lv_obj_set_style_transform_pivot_x(s_image_obj, pivot_x, LV_PART_MAIN);
         lv_obj_set_style_transform_pivot_y(s_image_obj, pivot_y, LV_PART_MAIN);
         lv_obj_center(s_image_obj);
@@ -688,23 +867,23 @@ static void slideshow_task(void *arg)
     bsp_display_lock(portMAX_DELAY);
 
 #if LVGL_VERSION_MAJOR >= 9
-    lv_obj_t *screen = lv_screen_active();
+    s_screen_obj = lv_screen_active();
 #else
-    lv_obj_t *screen = lv_scr_act();
+    s_screen_obj = lv_scr_act();
 #endif
 
-    lv_obj_set_style_bg_color(screen, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(s_screen_obj, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_screen_obj, LV_OPA_COVER, 0);
 
-    s_status_label = lv_label_create(screen);
+    s_image_obj = lv_image_create(s_screen_obj);
+    lv_image_set_antialias(s_image_obj, true);
+    lv_obj_center(s_image_obj);
+
+    s_status_label = lv_label_create(s_screen_obj);
     lv_obj_set_width(s_status_label, lv_pct(96));
     lv_label_set_long_mode(s_status_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
     lv_obj_set_style_text_color(s_status_label, lv_color_hex(0xD0D0D0), 0);
     lv_obj_align(s_status_label, LV_ALIGN_TOP_MID, 0, 10);
-
-    s_image_obj = lv_image_create(screen);
-    lv_image_set_antialias(s_image_obj, true);
-    lv_obj_center(s_image_obj);
 
     update_image_and_status(0);
 
