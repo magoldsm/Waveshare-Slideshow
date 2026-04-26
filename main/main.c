@@ -16,6 +16,9 @@
 #include "bsp/display.h"
 #include "esp_lvgl_port_touch.h"
 #include "esp_codec_dev.h"
+#include "esp_audio_dec_default.h"
+#include "esp_audio_simple_dec.h"
+#include "esp_audio_simple_dec_default.h"
 #include "lvgl.h"
 #include "draw/lv_image_decoder_private.h"
 
@@ -32,6 +35,10 @@
 #define STRICT_RAM_PRELOAD_MODE 1
 #define DISPLAY_DIAMETER 466
 #define DISPLAY_RADIUS (DISPLAY_DIAMETER / 2)
+#define MAX_MP3_PRELOAD_BYTES (5 * 1024 * 1024)
+#define TOUCH_DEBOUNCE_MS 300
+#define MP3_DEC_IN_CHUNK 1024
+#define MP3_DEC_OUT_CHUNK 4096
 
 static const char *TAG = "SLIDESHOW";
 
@@ -59,6 +66,9 @@ static size_t s_current_index;
 static sdmmc_card_t *s_sdcard;
 static esp_codec_dev_handle_t s_speaker_codec_dev;
 static bool s_audio_initialized = false;
+static bool s_audio_decoders_registered = false;
+static bool s_audio_playing = false;
+static TickType_t s_last_touch_tick = 0;
 
 static esp_err_t mount_sdcard_stable(void)
 {
@@ -243,7 +253,7 @@ static void try_load_mp3_for_image(size_t img_idx)
     long file_size = ftell(mp3_file);
     fseek(mp3_file, 0, SEEK_SET);
 
-    if (file_size <= 0 || file_size > 1000000) {  // Max 1 MB for MP3
+    if (file_size <= 0 || file_size > MAX_MP3_PRELOAD_BYTES) {
         ESP_LOGW(TAG, "MP3 file too large or invalid: %s (%ld bytes)", mp3_path, file_size);
         fclose(mp3_file);
         return;
@@ -706,7 +716,12 @@ static esp_err_t preload_images_into_memory(void)
         s_images[i].img_w = width;
         s_images[i].img_h = height;
         s_images[i].display_scale = compute_fill_scale(width, height);
-        s_images[i].backdrop_color = compute_edge_dominant_color(s_images[i].src);
+        if (bsp_display_lock(portMAX_DELAY)) {
+            s_images[i].backdrop_color = compute_edge_dominant_color(s_images[i].src);
+            bsp_display_unlock();
+        } else {
+            s_images[i].backdrop_color = lv_color_black();
+        }
 
         // Try to load associated MP3 file
         try_load_mp3_for_image(i);
@@ -899,7 +914,6 @@ static void update_image_and_status(size_t index)
     lv_label_set_text(s_status_label, status);
 }
 
-// Placeholder for MP3 playback. When audio hardware is available, this hooks into the codec.
 static void play_image_sound(size_t img_idx)
 {
     if (img_idx >= s_image_count) return;
@@ -910,42 +924,144 @@ static void play_image_sound(size_t img_idx)
             return;
         }
 
+        if (s_audio_playing) {
+            ESP_LOGI(TAG, "Audio is already playing, ignoring touch");
+            return;
+        }
+
+        s_audio_playing = true;
+
         ESP_LOGI(TAG, "Playing MP3 for image: %s (%u bytes)", 
                  s_images[img_idx].file_name, 
                  (unsigned)s_images[img_idx].mp3_size);
 
-        // Open codec for output
-        esp_codec_dev_sample_info_t fs = {
-            .sample_rate = 44100,
-            .channel = 1,
-            .bits_per_sample = 16,
+        esp_audio_simple_dec_cfg_t dec_cfg = {
+            .dec_type = ESP_AUDIO_SIMPLE_DEC_TYPE_MP3,
+            .dec_cfg = NULL,
+            .cfg_size = 0,
+            .use_frame_dec = false,
         };
 
-        esp_err_t err = esp_codec_dev_open(s_speaker_codec_dev, &fs);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to open codec device: %s", esp_err_to_name(err));
+        esp_audio_simple_dec_handle_t decoder = NULL;
+        esp_audio_err_t dec_ret = esp_audio_simple_dec_open(&dec_cfg, &decoder);
+        if (dec_ret != ESP_AUDIO_ERR_OK || decoder == NULL) {
+            ESP_LOGW(TAG, "Failed to open MP3 decoder: %d", (int)dec_ret);
+            s_audio_playing = false;
             return;
         }
 
-        // Set volume to moderate level (50%)
-        esp_codec_dev_set_out_vol(s_speaker_codec_dev, 50);
-
-        // Write MP3 data to codec
-        // Note: The codec may buffer and process MP3 data automatically
-        size_t written = 0;
-        err = esp_codec_dev_write(s_speaker_codec_dev, 
-                                   s_images[img_idx].mp3_data, 
-                                   s_images[img_idx].mp3_size);
-        if (err == ESP_OK) {
-            written = s_images[img_idx].mp3_size;
-            ESP_LOGI(TAG, "Wrote %u bytes to codec", (unsigned)written);
-        } else {
-            ESP_LOGW(TAG, "Failed to write to codec: %s", esp_err_to_name(err));
+        uint8_t *out_buf = (uint8_t *)malloc(MP3_DEC_OUT_CHUNK);
+        if (out_buf == NULL) {
+            ESP_LOGW(TAG, "No memory for MP3 decode output buffer");
+            esp_audio_simple_dec_close(decoder);
+            s_audio_playing = false;
+            return;
         }
 
-        // Close codec
-        esp_codec_dev_close(s_speaker_codec_dev);
-        ESP_LOGI(TAG, "MP3 playback finished");
+        size_t total_pcm_written = 0;
+        size_t offset = 0;
+        bool codec_opened = false;
+
+        while (offset < s_images[img_idx].mp3_size) {
+            size_t chunk = s_images[img_idx].mp3_size - offset;
+            if (chunk > MP3_DEC_IN_CHUNK) chunk = MP3_DEC_IN_CHUNK;
+
+            esp_audio_simple_dec_raw_t raw = {
+                .buffer = s_images[img_idx].mp3_data + offset,
+                .len = (uint32_t)chunk,
+                .eos = (offset + chunk >= s_images[img_idx].mp3_size),
+            };
+
+            while (raw.len > 0) {
+                esp_audio_simple_dec_out_t out = {
+                    .buffer = out_buf,
+                    .len = MP3_DEC_OUT_CHUNK,
+                };
+
+                dec_ret = esp_audio_simple_dec_process(decoder, &raw, &out);
+                if (dec_ret == ESP_AUDIO_ERR_BUFF_NOT_ENOUGH) {
+                    uint8_t *new_out = (uint8_t *)realloc(out_buf, out.needed_size);
+                    if (new_out == NULL) {
+                        ESP_LOGW(TAG, "Failed to grow MP3 output buffer to %u", (unsigned)out.needed_size);
+                        dec_ret = ESP_AUDIO_ERR_MEM_LACK;
+                        break;
+                    }
+                    out_buf = new_out;
+                    continue;
+                }
+
+                if (dec_ret != ESP_AUDIO_ERR_OK) {
+                    ESP_LOGW(TAG, "MP3 decode failed: %d", (int)dec_ret);
+                    break;
+                }
+
+                if (out.decoded_size > 0) {
+                    if (!codec_opened) {
+                        esp_audio_simple_dec_info_t dec_info = {0};
+                        dec_ret = esp_audio_simple_dec_get_info(decoder, &dec_info);
+                        if (dec_ret != ESP_AUDIO_ERR_OK) {
+                            ESP_LOGW(TAG, "Failed to get MP3 decode info: %d", (int)dec_ret);
+                            break;
+                        }
+
+                        esp_codec_dev_sample_info_t fs = {
+                            .sample_rate = dec_info.sample_rate,
+                            .channel = dec_info.channel,
+                            .bits_per_sample = dec_info.bits_per_sample,
+                        };
+
+                        esp_err_t err = esp_codec_dev_open(s_speaker_codec_dev, &fs);
+                        if (err != ESP_OK) {
+                            ESP_LOGW(TAG, "Failed to open codec device: %s", esp_err_to_name(err));
+                            break;
+                        }
+
+                        esp_codec_dev_set_out_vol(s_speaker_codec_dev, 50);
+                        codec_opened = true;
+                        ESP_LOGI(TAG, "MP3 decode info: %u Hz, %u-bit, %u ch",
+                                 (unsigned)dec_info.sample_rate,
+                                 (unsigned)dec_info.bits_per_sample,
+                                 (unsigned)dec_info.channel);
+                    }
+
+                    esp_err_t write_err = esp_codec_dev_write(s_speaker_codec_dev, out.buffer, out.decoded_size);
+                    if (write_err != ESP_OK) {
+                        ESP_LOGW(TAG, "PCM write failed: %s", esp_err_to_name(write_err));
+                        dec_ret = ESP_AUDIO_ERR_FAIL;
+                        break;
+                    }
+                    total_pcm_written += out.decoded_size;
+                }
+
+                if (raw.consumed == 0) {
+                    // Decoder needs more data to produce output
+                    break;
+                }
+
+                raw.buffer += raw.consumed;
+                raw.len -= raw.consumed;
+            }
+
+            if (dec_ret != ESP_AUDIO_ERR_OK) {
+                break;
+            }
+
+            offset += chunk;
+        }
+
+        if (codec_opened) {
+            esp_codec_dev_close(s_speaker_codec_dev);
+        }
+        esp_audio_simple_dec_close(decoder);
+        free(out_buf);
+
+        if (total_pcm_written > 0) {
+            ESP_LOGI(TAG, "MP3 playback finished, PCM bytes written: %u", (unsigned)total_pcm_written);
+        } else {
+            ESP_LOGW(TAG, "MP3 playback produced no PCM output");
+        }
+
+        s_audio_playing = false;
     }
 }
 
@@ -953,17 +1069,10 @@ static void play_image_sound(size_t img_idx)
 static esp_err_t audio_init(void)
 {
     if (s_audio_initialized) {
-        ESP_LOGW(TAG, "Audio already initialized");
         return ESP_OK;
     }
 
-    // Initialize I2C for codec communication
-    esp_err_t err = bsp_i2c_init();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize I2C: %s", esp_err_to_name(err));
-        return err;
-    }
-    ESP_LOGI(TAG, "I2C initialized");
+    esp_err_t err;
 
     // Initialize audio with default I2S config
     err = bsp_audio_init(NULL);
@@ -981,17 +1090,45 @@ static esp_err_t audio_init(void)
     }
     ESP_LOGI(TAG, "Speaker codec device initialized");
 
+    if (!s_audio_decoders_registered) {
+        esp_audio_err_t dec_ret = esp_audio_dec_register_default();
+        if (dec_ret != ESP_AUDIO_ERR_OK) {
+            ESP_LOGE(TAG, "Failed to register audio decoders: %d", (int)dec_ret);
+            return ESP_FAIL;
+        }
+
+        dec_ret = esp_audio_simple_dec_register_default();
+        if (dec_ret != ESP_AUDIO_ERR_OK) {
+            ESP_LOGE(TAG, "Failed to register simple decoders: %d", (int)dec_ret);
+            return ESP_FAIL;
+        }
+        s_audio_decoders_registered = true;
+    }
+
     s_audio_initialized = true;
     return ESP_OK;
 }
 
-// LVGL event callback for image object touch
+// LVGL event callback for touch-triggered sound playback
 static void on_image_touched(lv_event_t *event)
 {
     if (event == NULL) return;
 
     lv_event_code_t code = lv_event_get_code(event);
-    if (code == LV_EVENT_PRESSED) {
+    if (code == LV_EVENT_CLICKED) {
+        TickType_t now = xTaskGetTickCount();
+        if ((now - s_last_touch_tick) < pdMS_TO_TICKS(TOUCH_DEBOUNCE_MS)) {
+            return;
+        }
+        s_last_touch_tick = now;
+
+        if (!s_audio_initialized) {
+            esp_err_t audio_err = audio_init();
+            if (audio_err != ESP_OK) {
+                ESP_LOGW(TAG, "Audio initialization failed, playback disabled");
+                return;
+            }
+        }
         ESP_LOGI(TAG, "Screen touched, playing image sound");
         play_image_sound(s_current_index);
     }
@@ -1022,12 +1159,6 @@ static void slideshow_task(void *arg)
 
     log_startup_memory_health();
 
-    // Initialize audio for MP3 playback
-    esp_err_t audio_err = audio_init();
-    if (audio_err != ESP_OK) {
-        ESP_LOGW(TAG, "Audio initialization failed, playback disabled");
-    }
-
     ESP_ERROR_CHECK(mount_sdcard_with_retries());
     ESP_ERROR_CHECK(scan_sdcard_root_images());
     ESP_LOGI(TAG, "Starting image preload before slideshow transitions");
@@ -1053,13 +1184,13 @@ static void slideshow_task(void *arg)
 
     lv_obj_set_style_bg_color(s_screen_obj, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(s_screen_obj, LV_OPA_COVER, 0);
+    lv_obj_add_flag(s_screen_obj, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_screen_obj, on_image_touched, LV_EVENT_CLICKED, NULL);
 
     s_image_obj = lv_image_create(s_screen_obj);
     lv_image_set_antialias(s_image_obj, true);
+    lv_obj_add_flag(s_image_obj, LV_OBJ_FLAG_EVENT_BUBBLE);
     lv_obj_center(s_image_obj);
-
-    // Add touch event callback to play image sound
-    lv_obj_add_event_cb(s_image_obj, on_image_touched, LV_EVENT_PRESSED, NULL);
 
     s_status_label = lv_label_create(s_screen_obj);
     lv_obj_set_width(s_status_label, lv_pct(96));
