@@ -22,26 +22,39 @@
 #include "lvgl.h"
 #include "draw/lv_image_decoder_private.h"
 
-#define MAX_IMAGES 256
-#define IMAGE_CHANGE_MS 5000
-#define LVGL_FS_DRIVE_LETTER 'S'
-#define SLIDESHOW_TASK_STACK_SIZE 24576
-#define ENABLE_PNG_IN_SLIDESHOW 1
-#define SD_READ_TEST_MODE 0
-#define SD_READ_CHUNK_SIZE 4096
-#define SD_MOUNT_RETRY_DELAY_MS 1000
-#define PRELOAD_MAX_FILE_BYTES (180 * 1024)
-#define SLIDESHOW_VERBOSE_LOGS 0
-#define STRICT_RAM_PRELOAD_MODE 1
-#define DISPLAY_DIAMETER 466
-#define DISPLAY_RADIUS (DISPLAY_DIAMETER / 2)
-#define MAX_MP3_PRELOAD_BYTES (5 * 1024 * 1024)
-#define TOUCH_DEBOUNCE_MS 300
-#define MP3_DEC_IN_CHUNK 1024
-#define MP3_DEC_OUT_CHUNK 4096
-#define MP3_DEC_MAX_OUT_CHUNK (32 * 1024)
-#define AUDIO_PLAYBACK_TASK_STACK_SIZE 16384
-#define AUDIO_OUTPUT_VOLUME_PERCENT 85
+// Core slideshow limits and timing.
+#define MAX_IMAGES 256                         // Maximum number of image entries to index from SD root.
+#define IMAGE_CHANGE_MS 5000                  // Auto-advance interval between slides (ms).
+
+// LVGL filesystem integration and task sizing.
+#define LVGL_FS_DRIVE_LETTER 'S'              // LVGL drive letter mapped to SD mount.
+#define SLIDESHOW_TASK_STACK_SIZE 24576       // Stack size (bytes) for slideshow/LVGL orchestration task.
+
+// Image format and SD diagnostics.
+#define ENABLE_PNG_IN_SLIDESHOW 1             // 1: include PNG files when scanning supported image types.
+#define SD_READ_TEST_MODE 0                   // 1: bypass slideshow UI and run SD read stress loop.
+#define SD_READ_CHUNK_SIZE 4096               // Chunk size (bytes) used by SD read stress mode.
+#define SD_MOUNT_RETRY_DELAY_MS 1000          // Delay between SD mount retries (ms).
+
+// Preload policy (RAM/PSRAM vs file-backed decode).
+#define PRELOAD_MAX_FILE_BYTES (180 * 1024)   // In hybrid mode, images above this threshold stay file-backed.
+#define SLIDESHOW_VERBOSE_LOGS 0              // 1: emit per-file preload/memory diagnostics.
+#define STRICT_RAM_PRELOAD_MODE 1             // 1: require all images to preload; fail startup otherwise.
+
+// Display geometry used for fill-scale calculations.
+#define DISPLAY_DIAMETER 466                  // Circular panel diameter in pixels.
+#define DISPLAY_RADIUS (DISPLAY_DIAMETER / 2) // Derived radius in pixels.
+
+// Audio preload, touch debounce, and MP3 decode buffers.
+#define MAX_MP3_PRELOAD_BYTES (5 * 1024 * 1024) // Max MP3 size accepted for preload per image.
+#define TOUCH_DEBOUNCE_MS 300                 // Minimum interval between accepted touch events.
+#define MP3_DEC_IN_CHUNK 1024                 // MP3 input chunk fed into decoder per process step.
+#define MP3_DEC_OUT_CHUNK 4096                // Initial PCM output buffer size for decoder output.
+#define MP3_DEC_MAX_OUT_CHUNK (32 * 1024)     // Hard cap for decoder-requested output buffer growth.
+
+// Audio task/runtime settings.
+#define AUDIO_PLAYBACK_TASK_STACK_SIZE 16384  // Stack size (bytes) for asynchronous audio playback task.
+#define AUDIO_OUTPUT_VOLUME_PERCENT 85        // Speaker output gain percentage sent to codec.
 
 static const char *TAG = "SLIDESHOW";
 
@@ -60,21 +73,26 @@ typedef struct {
     size_t mp3_size;
 } image_entry_t;
 
-static lv_obj_t *s_screen_obj;
-static lv_obj_t *s_image_obj;
-static lv_obj_t *s_status_label;
+static lv_obj_t *s_screen_obj; // Root screen object used for backdrop color updates.
+static lv_obj_t *s_image_obj;  // Centered LVGL image widget displaying the active slide.
+static lv_obj_t *s_status_label; // Footer label showing index/name/decode status.
 static image_entry_t s_images[MAX_IMAGES];
 static size_t s_image_count;
 static size_t s_current_index;
-static sdmmc_card_t *s_sdcard;
-static esp_codec_dev_handle_t s_speaker_codec_dev;
+static sdmmc_card_t *s_sdcard; // Non-NULL while SD is mounted through VFS FAT.
+static esp_codec_dev_handle_t s_speaker_codec_dev; // BSP speaker codec handle.
 static bool s_audio_initialized = false;
 static bool s_audio_decoders_registered = false;
 static bool s_audio_playing = false;
 static TickType_t s_last_touch_tick = 0;
-static TaskHandle_t s_audio_task_handle = NULL;
-static size_t s_pending_audio_index = SIZE_MAX;
+static TaskHandle_t s_audio_task_handle = NULL; // Worker task that performs decode/write off UI callback.
+static size_t s_pending_audio_index = SIZE_MAX; // Slide index queued for next touch-triggered playback.
 
+/**
+ * Mount the SD card using stable 1-bit SDMMC settings for this board.
+ *
+ * @return ESP_OK on success, otherwise an ESP-IDF error from mount call.
+ */
 static esp_err_t mount_sdcard_stable(void)
 {
     const esp_vfs_fat_sdmmc_mount_config_t mount_config = {
@@ -107,9 +125,15 @@ static esp_err_t mount_sdcard_stable(void)
     return esp_vfs_fat_sdmmc_mount(BSP_SD_MOUNT_POINT, &host, &slot_config, &mount_config, &s_sdcard);
 }
 
+/**
+ * Retry SD mounting until it succeeds.
+ *
+ * @return Always ESP_OK after successful mount.
+ */
 static esp_err_t mount_sdcard_with_retries(void)
 {
     esp_err_t mount_err = ESP_FAIL;
+    // Keep retrying forever so a late-inserted SD card still recovers the app.
     while (mount_err != ESP_OK) {
         mount_err = mount_sdcard_stable();
         if (mount_err != ESP_OK) {
@@ -122,6 +146,15 @@ static esp_err_t mount_sdcard_with_retries(void)
     return ESP_OK;
 }
 
+/**
+ * Parse JPEG bytes and extract width/height from SOF markers.
+ *
+ * @param data JPEG file bytes.
+ * @param size Number of bytes in data.
+ * @param out_w Output image width in pixels.
+ * @param out_h Output image height in pixels.
+ * @return true if dimensions were found and valid; false otherwise.
+ */
 static bool jpeg_get_dimensions(const uint8_t *data, size_t size, uint16_t *out_w, uint16_t *out_h)
 {
     if (data == NULL || size < 4 || out_w == NULL || out_h == NULL) {
@@ -133,6 +166,7 @@ static bool jpeg_get_dimensions(const uint8_t *data, size_t size, uint16_t *out_
     }
 
     size_t pos = 2;
+    // Walk JPEG segments until we find a SOF marker that carries width/height.
     while (pos + 3 < size) {
         if (data[pos] != 0xFF) {
             pos++;
@@ -176,6 +210,12 @@ static bool jpeg_get_dimensions(const uint8_t *data, size_t size, uint16_t *out_
     return false;
 }
 
+/**
+ * Check whether a filename extension is one of the supported image types.
+ *
+ * @param name File name to inspect.
+ * @return true if extension is supported by slideshow scan logic.
+ */
 static bool has_supported_ext(const char *name)
 {
     const char *dot = strrchr(name, '.');
@@ -191,6 +231,15 @@ static bool has_supported_ext(const char *name)
            strcasecmp(dot, ".bmp") == 0;
 }
 
+/**
+ * Read PNG IHDR dimensions from in-memory bytes.
+ *
+ * @param data PNG file bytes.
+ * @param size Number of bytes in data.
+ * @param out_w Output image width in pixels.
+ * @param out_h Output image height in pixels.
+ * @return true if dimensions were parsed successfully; false otherwise.
+ */
 static bool png_get_dimensions(const uint8_t *data, size_t size, uint16_t *out_w, uint16_t *out_h)
 {
     // PNG: 8-byte signature + IHDR: 4 len + 4 type + 4 width + 4 height
@@ -204,6 +253,15 @@ static bool png_get_dimensions(const uint8_t *data, size_t size, uint16_t *out_w
     return true;
 }
 
+/**
+ * Read BMP header dimensions from in-memory bytes.
+ *
+ * @param data BMP file bytes.
+ * @param size Number of bytes in data.
+ * @param out_w Output image width in pixels.
+ * @param out_h Output image height in pixels.
+ * @return true if dimensions were parsed successfully; false otherwise.
+ */
 static bool bmp_get_dimensions(const uint8_t *data, size_t size, uint16_t *out_w, uint16_t *out_h)
 {
     // BMP: 'BM' + 8 bytes + 4 header size + 4 width (LE) + 4 height (LE) starting at byte 18
@@ -218,7 +276,13 @@ static bool bmp_get_dimensions(const uint8_t *data, size_t size, uint16_t *out_w
     return true;
 }
 
-// Build an MP3 filename from an image filename by replacing extension with .mp3
+/**
+ * Build the expected MP3 filename for an image by replacing extension with .mp3.
+ *
+ * @param image_name Source image filename.
+ * @param out_mp3_path Output buffer receiving derived MP3 filename.
+ * @param out_size Size of output buffer in bytes.
+ */
 static void build_mp3_filename(const char *image_name, char *out_mp3_path, size_t out_size)
 {
     if (image_name == NULL || out_mp3_path == NULL || out_size == 0) return;
@@ -233,7 +297,11 @@ static void build_mp3_filename(const char *image_name, char *out_mp3_path, size_
     }
 }
 
-// Try to load MP3 file matching the image basename
+/**
+ * Try to preload an MP3 that shares basename with the indexed image.
+ *
+ * @param img_idx Index in s_images to attach preloaded MP3 data to.
+ */
 static void try_load_mp3_for_image(size_t img_idx)
 {
     if (img_idx >= s_image_count) return;
@@ -264,7 +332,7 @@ static void try_load_mp3_for_image(size_t img_idx)
         return;
     }
 
-    // Allocate and read MP3 data
+    // Preload MP3 into PSRAM so touch playback does not block on SD I/O.
     uint8_t *mp3_data = (uint8_t *)heap_caps_malloc((size_t)file_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (mp3_data == NULL) {
         ESP_LOGW(TAG, "Failed to allocate PSRAM for MP3: %s", mp3_path);
@@ -286,8 +354,13 @@ static void try_load_mp3_for_image(size_t img_idx)
     ESP_LOGI(TAG, "Loaded MP3 for image %u: %s (%u bytes)", (unsigned)img_idx, mp3_path, (unsigned)read_bytes);
 }
 
-// Returns LVGL scale (256 = 1:1) so image corners just touch the circular display edge.
-// scale = DISPLAY_RADIUS / (half-diagonal of image)
+/**
+ * Compute LVGL transform scale so image corners reach the circular display edge.
+ *
+ * @param img_w Source image width in pixels.
+ * @param img_h Source image height in pixels.
+ * @return LVGL scale value (LV_SCALE_NONE is 1:1).
+ */
 static uint32_t compute_fill_scale(uint16_t img_w, uint16_t img_h)
 {
     if (img_w == 0 || img_h == 0) return LV_SCALE_NONE;
@@ -298,6 +371,17 @@ static uint32_t compute_fill_scale(uint16_t img_w, uint16_t img_h)
     return lvgl_scale;
 }
 
+/**
+ * Decode a pixel from an LVGL draw buffer into 8-bit RGB channels.
+ *
+ * @param buf Draw buffer returned by image decoder.
+ * @param x X coordinate within draw buffer.
+ * @param y Y coordinate within draw buffer.
+ * @param out_r Output red channel.
+ * @param out_g Output green channel.
+ * @param out_b Output blue channel.
+ * @return true if conversion succeeded for current color format; false otherwise.
+ */
 static bool decode_rgb_from_draw_buf(const lv_draw_buf_t *buf, uint32_t x, uint32_t y,
                                      uint8_t *out_r, uint8_t *out_g, uint8_t *out_b)
 {
@@ -346,6 +430,12 @@ static bool decode_rgb_from_draw_buf(const lv_draw_buf_t *buf, uint32_t x, uint3
     return false;
 }
 
+/**
+ * Compute dominant edge color for an image source to use as circular-screen backdrop.
+ *
+ * @param src LVGL image source (RAM-backed descriptor or file-backed path).
+ * @return Dominant edge color, or black on decode failure.
+ */
 static lv_color_t compute_edge_dominant_color(const void *src)
 {
     enum { COLOR_BINS_PER_CHANNEL = 6, COLOR_BIN_COUNT = 216 };
@@ -469,6 +559,13 @@ static lv_color_t compute_edge_dominant_color(const void *src)
     return lv_color_make(r, g, b);
 }
 
+/**
+ * Case-insensitive extension check against a single expected extension.
+ *
+ * @param name Filename to inspect.
+ * @param ext Extension to compare, including leading dot.
+ * @return true when name ends with ext.
+ */
 static bool has_ext(const char *name, const char *ext)
 {
     const char *dot = strrchr(name, '.');
@@ -478,6 +575,13 @@ static bool has_ext(const char *name, const char *ext)
     return strcasecmp(dot, ext) == 0;
 }
 
+/**
+ * Comparator used to sort image entries alphabetically by filename.
+ *
+ * @param a Pointer to first image_entry_t.
+ * @param b Pointer to second image_entry_t.
+ * @return <0, 0, >0 following qsort comparator contract.
+ */
 static int file_name_cmp(const void *a, const void *b)
 {
     const image_entry_t *lhs = (const image_entry_t *)a;
@@ -485,6 +589,12 @@ static int file_name_cmp(const void *a, const void *b)
     return strcasecmp(lhs->file_name, rhs->file_name);
 }
 
+/**
+ * Duplicate a candidate LVGL source path only if decoder can identify it.
+ *
+ * @param src Candidate LVGL image source path.
+ * @return Newly allocated duplicate string on success, otherwise NULL.
+ */
 static char *dup_if_decodable(const char *src)
 {
     lv_image_header_t header;
@@ -495,9 +605,16 @@ static char *dup_if_decodable(const char *src)
     return strdup(src);
 }
 
+/**
+ * Build and validate an LVGL source string for an image file.
+ *
+ * @param file_name Image file name found on SD root.
+ * @return Heap-allocated LVGL source string, or NULL if not decodable.
+ */
 static char *resolve_image_src(const char *file_name)
 {
     char src_path[384];
+    // Prefer explicit mount path first, then try root-relative fallback for LVGL FS.
     int written = snprintf(src_path, sizeof(src_path), "%c:%s/%s",
                            LVGL_FS_DRIVE_LETTER,
                            BSP_SD_MOUNT_POINT,
@@ -519,6 +636,11 @@ static char *resolve_image_src(const char *file_name)
     return NULL;
 }
 
+/**
+ * Scan SD card root directory and populate slideshow image list.
+ *
+ * @return ESP_OK on success, otherwise an error if directory or allocation fails.
+ */
 static esp_err_t scan_sdcard_root_images(void)
 {
     DIR *dir = opendir(BSP_SD_MOUNT_POINT);
@@ -532,6 +654,7 @@ static esp_err_t scan_sdcard_root_images(void)
         if (entry->d_name[0] == '.') {
             continue;
         }
+        // Only keep image files the slideshow can decode.
         if (!has_supported_ext(entry->d_name)) {
             continue;
         }
@@ -568,6 +691,14 @@ static esp_err_t scan_sdcard_root_images(void)
     return ESP_OK;
 }
 
+/**
+ * Read an entire file into RAM/PSRAM.
+ *
+ * @param file_name File name relative to SD mount point.
+ * @param out_data Output pointer receiving allocated file buffer.
+ * @param out_bytes Output byte count of loaded file.
+ * @return ESP_OK on success, otherwise an ESP-IDF error code.
+ */
 static esp_err_t read_file_into_memory(const char *file_name, uint8_t **out_data, size_t *out_bytes)
 {
     char path[384];
@@ -607,6 +738,7 @@ static esp_err_t read_file_into_memory(const char *file_name, uint8_t **out_data
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 #endif
 
+    // Try PSRAM first to protect internal RAM for stacks and LVGL runtime allocations.
     uint8_t *data = (uint8_t *)heap_caps_malloc(alloc_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (data == NULL) {
         data = (uint8_t *)heap_caps_malloc(alloc_size, MALLOC_CAP_8BIT);
@@ -634,6 +766,11 @@ static esp_err_t read_file_into_memory(const char *file_name, uint8_t **out_data
     return ESP_OK;
 }
 
+/**
+ * Preload slideshow images (and optional per-image MP3 files) into memory.
+ *
+ * @return ESP_OK when preload policy is satisfied; error otherwise.
+ */
 static esp_err_t preload_images_into_memory(void)
 {
     size_t loaded_ram = 0;
@@ -652,6 +789,7 @@ static esp_err_t preload_images_into_memory(void)
         size_t size = 0;
         esp_err_t err = read_file_into_memory(s_images[i].file_name, &data, &size);
 
+        // In hybrid mode, keep very large or failed files as LVGL file-backed sources.
         if (!STRICT_RAM_PRELOAD_MODE && (err == ESP_ERR_NO_MEM || (err == ESP_OK && size > PRELOAD_MAX_FILE_BYTES))) {
             if (err == ESP_OK) {
                 free(data);
@@ -708,6 +846,7 @@ static esp_err_t preload_images_into_memory(void)
             s_images[i].image_dsc.header.h = height;
         }
 
+        // Use in-memory descriptor as the active source for this slide.
         s_images[i].src = &s_images[i].image_dsc;
         loaded_ram++;
 
@@ -721,6 +860,7 @@ static esp_err_t preload_images_into_memory(void)
         s_images[i].img_w = width;
         s_images[i].img_h = height;
         s_images[i].display_scale = compute_fill_scale(width, height);
+        // Compute a dominant edge color so round-screen corners blend with the image.
         if (bsp_display_lock(portMAX_DELAY)) {
             s_images[i].backdrop_color = compute_edge_dominant_color(s_images[i].src);
             bsp_display_unlock();
@@ -768,6 +908,11 @@ static esp_err_t preload_images_into_memory(void)
     return ESP_OK;
 }
 
+/**
+ * Check whether every image source is RAM-backed.
+ *
+ * @return true if all images use in-memory descriptors, false otherwise.
+ */
 static bool all_images_are_ram_backed(void)
 {
     if (s_image_count == 0) {
@@ -783,6 +928,9 @@ static bool all_images_are_ram_backed(void)
     return true;
 }
 
+/**
+ * Log startup heap capacity and fragmentation indicators for internal RAM and PSRAM.
+ */
 static void log_startup_memory_health(void)
 {
     size_t int_total = heap_caps_get_total_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -806,6 +954,13 @@ static void log_startup_memory_health(void)
 }
 
 #if SD_READ_TEST_MODE
+/**
+ * Read a file completely for SD stress-test instrumentation.
+ *
+ * @param file_name File name relative to SD mount point.
+ * @param out_bytes Output total bytes read.
+ * @return ESP_OK on success, otherwise an ESP-IDF error code.
+ */
 static esp_err_t read_file_fully(const char *file_name, size_t *out_bytes)
 {
     char path[384];
@@ -837,6 +992,11 @@ static esp_err_t read_file_fully(const char *file_name, size_t *out_bytes)
     return ESP_OK;
 }
 
+/**
+ * Continuous SD throughput/stability test task (enabled by SD_READ_TEST_MODE).
+ *
+ * @param arg Unused FreeRTOS task argument.
+ */
 static void sd_read_test_task(void *arg)
 {
     (void)arg;
@@ -880,6 +1040,11 @@ static void sd_read_test_task(void *arg)
 }
 #endif
 
+/**
+ * Update displayed image object and top status text for the requested index.
+ *
+ * @param index Target image index (wrapped modulo image count).
+ */
 static void update_image_and_status(size_t index)
 {
     if (s_image_count == 0) {
@@ -887,6 +1052,7 @@ static void update_image_and_status(size_t index)
         return;
     }
 
+    // Wrap index so both manual and timed transitions remain bounds-safe.
     s_current_index = index % s_image_count;
 
     const void *image_src = s_images[s_current_index].src;
@@ -898,6 +1064,7 @@ static void update_image_and_status(size_t index)
         int32_t pivot_y = (s_images[s_current_index].img_h > 0) ? (s_images[s_current_index].img_h / 2) : (lv_obj_get_height(s_image_obj) / 2);
 
         lv_image_set_src(s_image_obj, image_src);
+        // Apply per-image scale/pivot so content fills the circular panel consistently.
         uint32_t scale = s_images[s_current_index].display_scale;
         if (scale == 0) scale = LV_SCALE_NONE;
         lv_image_set_scale(s_image_obj, LV_SCALE_NONE);
@@ -919,10 +1086,16 @@ static void update_image_and_status(size_t index)
     lv_label_set_text(s_status_label, status);
 }
 
+/**
+ * Decode and play preloaded MP3 associated with the selected image.
+ *
+ * @param img_idx Image index in s_images.
+ */
 static void play_image_sound(size_t img_idx)
 {
     if (img_idx >= s_image_count) return;
 
+    // Audio is optional per slide; silently skip when no matching MP3 is preloaded.
     if (s_images[img_idx].mp3_data != NULL && s_images[img_idx].mp3_size > 0) {
         if (!s_audio_initialized || s_speaker_codec_dev == NULL) {
             ESP_LOGW(TAG, "Audio not initialized, cannot play MP3");
@@ -962,6 +1135,7 @@ static void play_image_sound(size_t img_idx)
         size_t offset = 0;
         bool codec_opened = false;
 
+        // Stream the preloaded MP3 buffer through the decoder in bounded chunks.
         while (offset < s_images[img_idx].mp3_size) {
             size_t chunk = s_images[img_idx].mp3_size - offset;
             if (chunk > MP3_DEC_IN_CHUNK) chunk = MP3_DEC_IN_CHUNK;
@@ -980,6 +1154,7 @@ static void play_image_sound(size_t img_idx)
 
                 dec_ret = esp_audio_simple_dec_process(decoder, &raw, &out);
                 if (dec_ret == ESP_AUDIO_ERR_BUFF_NOT_ENOUGH) {
+                    // Decoder can request larger output for frame bursts; grow within a hard cap.
                     if (out.needed_size > MP3_DEC_MAX_OUT_CHUNK) {
                         ESP_LOGW(TAG, "MP3 output buffer request too large: %u", (unsigned)out.needed_size);
                         dec_ret = ESP_AUDIO_ERR_MEM_LACK;
@@ -1009,6 +1184,7 @@ static void play_image_sound(size_t img_idx)
 
                 if (out.decoded_size > 0) {
                     if (!codec_opened) {
+                        // Open speaker codec lazily once decoder reports the final PCM format.
                         esp_audio_simple_dec_info_t dec_info = {0};
                         dec_ret = esp_audio_simple_dec_get_info(decoder, &dec_info);
                         if (dec_ret != ESP_AUDIO_ERR_OK) {
@@ -1075,11 +1251,17 @@ static void play_image_sound(size_t img_idx)
     }
 }
 
+/**
+ * Background audio worker task that runs decoding outside LVGL event callbacks.
+ *
+ * @param arg Unused FreeRTOS task argument.
+ */
 static void audio_playback_task(void *arg)
 {
     (void)arg;
 
     while (1) {
+        // Wake only when touch callback enqueues a slide index.
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
         size_t img_idx = s_pending_audio_index;
@@ -1093,7 +1275,11 @@ static void audio_playback_task(void *arg)
     }
 }
 
-// Initialize audio subsystem
+/**
+ * Initialize codec, decoder registrations, and background audio task.
+ *
+ * @return ESP_OK on success, otherwise an ESP-IDF error code.
+ */
 static esp_err_t audio_init(void)
 {
     if (s_audio_initialized) {
@@ -1154,7 +1340,11 @@ static esp_err_t audio_init(void)
     return ESP_OK;
 }
 
-// LVGL event callback for touch-triggered sound playback
+/**
+ * LVGL click callback that debounces touch and queues audio playback.
+ *
+ * @param event LVGL event object for current interaction.
+ */
 static void on_image_touched(lv_event_t *event)
 {
     if (event == NULL) return;
@@ -1162,6 +1352,7 @@ static void on_image_touched(lv_event_t *event)
     lv_event_code_t code = lv_event_get_code(event);
     if (code == LV_EVENT_CLICKED) {
         TickType_t now = xTaskGetTickCount();
+        // Debounce touch noise and rapid taps to avoid overlapping playbacks.
         if ((now - s_last_touch_tick) < pdMS_TO_TICKS(TOUCH_DEBOUNCE_MS)) {
             return;
         }
@@ -1186,12 +1377,18 @@ static void on_image_touched(lv_event_t *event)
         }
 
         ESP_LOGI(TAG, "Screen touched, playing image sound");
+        // Hand off decode/write work to audio task so LVGL callback stays responsive.
         s_audio_playing = true;
         s_pending_audio_index = s_current_index;
         xTaskNotifyGive(s_audio_task_handle);
     }
 }
 
+/**
+ * Main slideshow task: initialize display, preload assets, and run auto-advance loop.
+ *
+ * @param arg Unused FreeRTOS task argument.
+ */
 static void slideshow_task(void *arg)
 {
     (void)arg;
@@ -1220,9 +1417,11 @@ static void slideshow_task(void *arg)
     ESP_ERROR_CHECK(mount_sdcard_with_retries());
     ESP_ERROR_CHECK(scan_sdcard_root_images());
     ESP_LOGI(TAG, "Starting image preload before slideshow transitions");
+    // Load all slide assets up front to avoid SD latency during transitions.
     ESP_ERROR_CHECK(preload_images_into_memory());
 
     if (all_images_are_ram_backed()) {
+        // If everything is memory-backed, release SD resources after startup.
         if (s_sdcard != NULL) {
             esp_vfs_fat_sdcard_unmount(BSP_SD_MOUNT_POINT, s_sdcard);
             s_sdcard = NULL;
@@ -1268,6 +1467,7 @@ static void slideshow_task(void *arg)
             ESP_LOGW(TAG, "Low slideshow stack watermark: %u words", (unsigned)stack_words_free);
         }
 
+        // Tick slideshow at 1 Hz and advance when configured interval is reached.
         if (s_image_count > 1) {
             elapsed_ms += 1000;
             if (elapsed_ms >= IMAGE_CHANGE_MS) {
@@ -1283,6 +1483,9 @@ static void slideshow_task(void *arg)
     }
 }
 
+/**
+ * ESP-IDF application entry point; starts slideshow task or SD test task.
+ */
 void app_main(void)
 {
 #if SD_READ_TEST_MODE
