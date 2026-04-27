@@ -16,3 +16,4 @@ __pycache__/
 # OS files
 .DS_Store
 Thumbs.db
+Firmware/ESP32-S3-Touch-AMOLED-1.75-FactoryOnly.bin
