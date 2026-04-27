@@ -1069,12 +1069,14 @@ static bool apply_image_to_obj(lv_obj_t *target_obj, size_t img_idx)
 
     lv_image_set_src(target_obj, image_src);
     uint32_t scale = s_images[img_idx].display_scale;
-    if (scale == 0) scale = LV_SCALE_NONE;
-    lv_image_set_scale(target_obj, LV_SCALE_NONE);
-    lv_obj_set_style_transform_scale(target_obj, (int32_t)scale, LV_PART_MAIN);
-    lv_obj_set_style_transform_pivot_x(target_obj, pivot_x, LV_PART_MAIN);
-    lv_obj_set_style_transform_pivot_y(target_obj, pivot_y, LV_PART_MAIN);
-    lv_obj_center(target_obj);
+    if (scale == 0 || scale == LV_SCALE_NONE) {
+        // Keep identity transform for native-sized assets to minimize redraw cost.
+        lv_obj_set_style_transform_scale(target_obj, LV_SCALE_NONE, LV_PART_MAIN);
+    } else {
+        lv_obj_set_style_transform_scale(target_obj, (int32_t)scale, LV_PART_MAIN);
+            lv_obj_set_style_transform_pivot_x(target_obj, pivot_x, LV_PART_MAIN);
+            lv_obj_set_style_transform_pivot_y(target_obj, pivot_y, LV_PART_MAIN);
+        }
     return true;
 }
 
@@ -1120,6 +1122,35 @@ static void update_image_and_status(size_t index)
              s_images[s_current_index].file_name,
              image_ok ? "" : " (decode failed)");
     lv_label_set_text(s_status_label, status);
+}
+
+/**
+ * Apply slide change while panel brightness is temporarily blanked.
+ *
+ * On this AMOLED BSP, "backlight" helpers drive register 0x51 brightness,
+ * so this hides the visible chunked flush without requiring full-frame DMA buffers.
+ */
+static void update_image_with_masked_brightness(lv_display_t *display, size_t index)
+{
+    const int normal_brightness = 100;
+
+    esp_err_t err = bsp_display_brightness_set(0);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to blank display before swap: %s", esp_err_to_name(err));
+    }
+
+    bsp_display_lock(portMAX_DELAY);
+    update_image_and_status(index);
+    if (display != NULL) {
+        // Block until all queued flush chunks complete while display is blanked.
+        lv_refr_now(display);
+    }
+    bsp_display_unlock();
+
+    err = bsp_display_brightness_set(normal_brightness);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to restore display brightness after swap: %s", esp_err_to_name(err));
+    }
 }
 
 /**
@@ -1430,7 +1461,18 @@ static void slideshow_task(void *arg)
     (void)arg;
     ESP_LOGI(TAG, "Starting SD card slideshow");
 
-    lv_display_t *display = bsp_display_start();
+    bsp_display_cfg_t display_cfg = {
+        .lvgl_port_cfg = ESP_LVGL_PORT_INIT_CONFIG(),
+        .buffer_size = BSP_LCD_DRAW_BUFF_SIZE,
+        .double_buffer = BSP_LCD_DRAW_BUFF_DOUBLE,
+        .flags = {
+            .buff_dma = true,
+            .buff_spiram = false,
+        },
+    };
+    display_cfg.lvgl_port_cfg.task_stack = 16384;
+
+    lv_display_t *display = bsp_display_start_with_config(&display_cfg);
     if (display == NULL) {
         ESP_LOGE(TAG, "Display initialization failed");
         return;
@@ -1481,12 +1523,12 @@ static void slideshow_task(void *arg)
     lv_obj_add_event_cb(s_screen_obj, on_image_touched, LV_EVENT_CLICKED, NULL);
 
     s_image_objs[0] = lv_image_create(s_screen_obj);
-    lv_image_set_antialias(s_image_objs[0], true);
+    lv_image_set_antialias(s_image_objs[0], false);
     lv_obj_add_flag(s_image_objs[0], LV_OBJ_FLAG_EVENT_BUBBLE);
     lv_obj_center(s_image_objs[0]);
 
     s_image_objs[1] = lv_image_create(s_screen_obj);
-    lv_image_set_antialias(s_image_objs[1], true);
+    lv_image_set_antialias(s_image_objs[1], false);
     lv_obj_add_flag(s_image_objs[1], LV_OBJ_FLAG_EVENT_BUBBLE);
     lv_obj_add_flag(s_image_objs[1], LV_OBJ_FLAG_HIDDEN);
     lv_obj_center(s_image_objs[1]);
@@ -1494,13 +1536,12 @@ static void slideshow_task(void *arg)
 
     s_status_label = lv_label_create(s_screen_obj);
     lv_obj_set_width(s_status_label, lv_pct(96));
-    lv_label_set_long_mode(s_status_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_label_set_long_mode(s_status_label, LV_LABEL_LONG_CLIP);
     lv_obj_set_style_text_color(s_status_label, lv_color_hex(0xD0D0D0), 0);
     lv_obj_align(s_status_label, LV_ALIGN_TOP_MID, 0, 10);
 
     update_image_and_status(0);
-    // Force first frame decode/flush from slideshow task context to avoid LVGL task stack pressure.
-    lv_refr_now(display);
+    // Keep first frame path simple while screen is already locked here.
     bsp_display_unlock();
 
     uint32_t elapsed_ms = 0;
@@ -1515,11 +1556,7 @@ static void slideshow_task(void *arg)
             elapsed_ms += 1000;
             if (elapsed_ms >= IMAGE_CHANGE_MS) {
                 elapsed_ms = 0;
-                bsp_display_lock(portMAX_DELAY);
-                update_image_and_status((s_current_index + 1) % s_image_count);
-                // Keep decode/flush on this task; deferring to taskLVGL can overflow its stack.
-                lv_refr_now(display);
-                bsp_display_unlock();
+                update_image_with_masked_brightness(display, (s_current_index + 1) % s_image_count);
             }
         }
 
