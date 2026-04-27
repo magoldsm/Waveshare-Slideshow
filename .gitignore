@@ -6,6 +6,7 @@ managed_components/
 .vscode/
 
 # Generated or machine-local config
+.clangd
 sdkconfig
 sdkconfig.old
 
