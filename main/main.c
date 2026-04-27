@@ -74,7 +74,8 @@ typedef struct {
 } image_entry_t;
 
 static lv_obj_t *s_screen_obj; // Root screen object used for backdrop color updates.
-static lv_obj_t *s_image_obj;  // Centered LVGL image widget displaying the active slide.
+static lv_obj_t *s_image_objs[2]; // Double-buffered LVGL image widgets for flip-style swaps.
+static uint8_t s_active_image_obj_idx = 0; // Index of currently visible image object.
 static lv_obj_t *s_status_label; // Footer label showing index/name/decode status.
 static image_entry_t s_images[MAX_IMAGES];
 static size_t s_image_count;
@@ -1041,6 +1042,43 @@ static void sd_read_test_task(void *arg)
 #endif
 
 /**
+ * Apply an image entry to a target LVGL image object, including transform metadata.
+ *
+ * @param target_obj LVGL image object to update.
+ * @param img_idx Index of image entry in s_images.
+ * @return true when image source exists and was assigned; false if slide is invalid/undecodable.
+ */
+static bool apply_image_to_obj(lv_obj_t *target_obj, size_t img_idx)
+{
+    if (target_obj == NULL || img_idx >= s_image_count) {
+        return false;
+    }
+
+    const void *image_src = s_images[img_idx].src;
+    if (image_src == NULL) {
+        lv_image_set_src(target_obj, NULL);
+        return false;
+    }
+
+    int32_t pivot_x = (s_images[img_idx].img_w > 0) ?
+                      (s_images[img_idx].img_w / 2) :
+                      (lv_obj_get_width(target_obj) / 2);
+    int32_t pivot_y = (s_images[img_idx].img_h > 0) ?
+                      (s_images[img_idx].img_h / 2) :
+                      (lv_obj_get_height(target_obj) / 2);
+
+    lv_image_set_src(target_obj, image_src);
+    uint32_t scale = s_images[img_idx].display_scale;
+    if (scale == 0) scale = LV_SCALE_NONE;
+    lv_image_set_scale(target_obj, LV_SCALE_NONE);
+    lv_obj_set_style_transform_scale(target_obj, (int32_t)scale, LV_PART_MAIN);
+    lv_obj_set_style_transform_pivot_x(target_obj, pivot_x, LV_PART_MAIN);
+    lv_obj_set_style_transform_pivot_y(target_obj, pivot_y, LV_PART_MAIN);
+    lv_obj_center(target_obj);
+    return true;
+}
+
+/**
  * Update displayed image object and top status text for the requested index.
  *
  * @param index Target image index (wrapped modulo image count).
@@ -1055,25 +1093,23 @@ static void update_image_and_status(size_t index)
     // Wrap index so both manual and timed transitions remain bounds-safe.
     s_current_index = index % s_image_count;
 
-    const void *image_src = s_images[s_current_index].src;
-    bool image_ok = image_src != NULL;
+    uint8_t next_obj_idx = (uint8_t)(1U - s_active_image_obj_idx);
+    lv_obj_t *front_obj = s_image_objs[s_active_image_obj_idx];
+    lv_obj_t *back_obj = s_image_objs[next_obj_idx];
+
+    // Stage next slide into hidden object, then atomically swap visibility.
+    bool image_ok = apply_image_to_obj(back_obj, s_current_index);
     if (image_ok) {
         lv_obj_set_style_bg_color(s_screen_obj, s_images[s_current_index].backdrop_color, 0);
-
-        int32_t pivot_x = (s_images[s_current_index].img_w > 0) ? (s_images[s_current_index].img_w / 2) : (lv_obj_get_width(s_image_obj) / 2);
-        int32_t pivot_y = (s_images[s_current_index].img_h > 0) ? (s_images[s_current_index].img_h / 2) : (lv_obj_get_height(s_image_obj) / 2);
-
-        lv_image_set_src(s_image_obj, image_src);
-        // Apply per-image scale/pivot so content fills the circular panel consistently.
-        uint32_t scale = s_images[s_current_index].display_scale;
-        if (scale == 0) scale = LV_SCALE_NONE;
-        lv_image_set_scale(s_image_obj, LV_SCALE_NONE);
-        lv_obj_set_style_transform_scale(s_image_obj, (int32_t)scale, LV_PART_MAIN);
-        lv_obj_set_style_transform_pivot_x(s_image_obj, pivot_x, LV_PART_MAIN);
-        lv_obj_set_style_transform_pivot_y(s_image_obj, pivot_y, LV_PART_MAIN);
-        lv_obj_center(s_image_obj);
+        lv_obj_clear_flag(back_obj, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(front_obj, LV_OBJ_FLAG_HIDDEN);
+        s_active_image_obj_idx = next_obj_idx;
     } else {
-        lv_image_set_src(s_image_obj, NULL);
+        lv_obj_set_style_bg_color(s_screen_obj, lv_color_black(), 0);
+        lv_image_set_src(back_obj, NULL);
+        lv_obj_clear_flag(back_obj, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(front_obj, LV_OBJ_FLAG_HIDDEN);
+        s_active_image_obj_idx = next_obj_idx;
         ESP_LOGW(TAG, "Image decode failed: %s", s_images[s_current_index].file_name);
     }
 
@@ -1444,10 +1480,17 @@ static void slideshow_task(void *arg)
     lv_obj_add_flag(s_screen_obj, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_screen_obj, on_image_touched, LV_EVENT_CLICKED, NULL);
 
-    s_image_obj = lv_image_create(s_screen_obj);
-    lv_image_set_antialias(s_image_obj, true);
-    lv_obj_add_flag(s_image_obj, LV_OBJ_FLAG_EVENT_BUBBLE);
-    lv_obj_center(s_image_obj);
+    s_image_objs[0] = lv_image_create(s_screen_obj);
+    lv_image_set_antialias(s_image_objs[0], true);
+    lv_obj_add_flag(s_image_objs[0], LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_center(s_image_objs[0]);
+
+    s_image_objs[1] = lv_image_create(s_screen_obj);
+    lv_image_set_antialias(s_image_objs[1], true);
+    lv_obj_add_flag(s_image_objs[1], LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_add_flag(s_image_objs[1], LV_OBJ_FLAG_HIDDEN);
+    lv_obj_center(s_image_objs[1]);
+    s_active_image_obj_idx = 0;
 
     s_status_label = lv_label_create(s_screen_obj);
     lv_obj_set_width(s_status_label, lv_pct(96));
@@ -1456,7 +1499,7 @@ static void slideshow_task(void *arg)
     lv_obj_align(s_status_label, LV_ALIGN_TOP_MID, 0, 10);
 
     update_image_and_status(0);
-
+    // Force first frame decode/flush from slideshow task context to avoid LVGL task stack pressure.
     lv_refr_now(display);
     bsp_display_unlock();
 
@@ -1474,6 +1517,7 @@ static void slideshow_task(void *arg)
                 elapsed_ms = 0;
                 bsp_display_lock(portMAX_DELAY);
                 update_image_and_status((s_current_index + 1) % s_image_count);
+                // Keep decode/flush on this task; deferring to taskLVGL can overflow its stack.
                 lv_refr_now(display);
                 bsp_display_unlock();
             }
