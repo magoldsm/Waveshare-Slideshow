@@ -93,6 +93,8 @@ static size_t s_image_count;
 static size_t s_current_index;
 static sdmmc_card_t *s_sdcard; // Non-NULL while SD is mounted through VFS FAT.
 static esp_codec_dev_handle_t s_speaker_codec_dev; // BSP speaker codec handle.
+static bool s_speaker_codec_open = false; // True once speaker codec stream has been opened.
+static esp_codec_dev_sample_info_t s_speaker_codec_fmt = {0}; // Active speaker stream format.
 static bool s_audio_initialized = false;
 static bool s_audio_decoders_registered = false;
 static bool s_audio_playing = false;
@@ -105,6 +107,16 @@ static bool s_touch_start_valid = false;
 static lv_point_t s_last_touch_down_point = {0}; // Last touch-down point on slideshow page.
 static bool s_last_touch_down_valid = false;
 static uint8_t s_battery_page_idx = 0;
+
+static bool codec_fmt_matches(const esp_codec_dev_sample_info_t *a, const esp_codec_dev_sample_info_t *b)
+{
+    if (a == NULL || b == NULL) {
+        return false;
+    }
+    return a->sample_rate == b->sample_rate
+        && a->channel == b->channel
+        && a->bits_per_sample == b->bits_per_sample;
+}
 
 static uint32_t ui_get_vertical_res(void)
 {
@@ -1533,8 +1545,6 @@ static void play_image_sound(size_t img_idx)
 
         size_t total_pcm_written = 0;
         size_t offset = 0;
-        bool codec_opened = false;
-
         // Stream the preloaded MP3 buffer through the decoder in bounded chunks.
         while (offset < s_images[img_idx].mp3_size) {
             size_t chunk = s_images[img_idx].mp3_size - offset;
@@ -1583,29 +1593,36 @@ static void play_image_sound(size_t img_idx)
                 }
 
                 if (out.decoded_size > 0) {
-                    if (!codec_opened) {
-                        // Open speaker codec lazily once decoder reports the final PCM format.
-                        esp_audio_simple_dec_info_t dec_info = {0};
-                        dec_ret = esp_audio_simple_dec_get_info(decoder, &dec_info);
-                        if (dec_ret != ESP_AUDIO_ERR_OK) {
-                            ESP_LOGW(TAG, "Failed to get MP3 decode info: %d", (int)dec_ret);
-                            break;
-                        }
+                    // Open speaker codec lazily once decoder reports the final PCM format.
+                    esp_audio_simple_dec_info_t dec_info = {0};
+                    dec_ret = esp_audio_simple_dec_get_info(decoder, &dec_info);
+                    if (dec_ret != ESP_AUDIO_ERR_OK) {
+                        ESP_LOGW(TAG, "Failed to get MP3 decode info: %d", (int)dec_ret);
+                        break;
+                    }
 
-                        esp_codec_dev_sample_info_t fs = {
-                            .sample_rate = dec_info.sample_rate,
-                            .channel = dec_info.channel,
-                            .bits_per_sample = dec_info.bits_per_sample,
-                        };
+                    esp_codec_dev_sample_info_t fs = {
+                        .sample_rate = dec_info.sample_rate,
+                        .channel = dec_info.channel,
+                        .bits_per_sample = dec_info.bits_per_sample,
+                    };
+
+                    if (!s_speaker_codec_open || !codec_fmt_matches(&s_speaker_codec_fmt, &fs)) {
+                        if (s_speaker_codec_open) {
+                            esp_codec_dev_close(s_speaker_codec_dev);
+                            s_speaker_codec_open = false;
+                        }
 
                         esp_err_t err = esp_codec_dev_open(s_speaker_codec_dev, &fs);
                         if (err != ESP_OK) {
                             ESP_LOGW(TAG, "Failed to open codec device: %s", esp_err_to_name(err));
+                            dec_ret = ESP_AUDIO_ERR_FAIL;
                             break;
                         }
 
                         esp_codec_dev_set_out_vol(s_speaker_codec_dev, AUDIO_OUTPUT_VOLUME_PERCENT);
-                        codec_opened = true;
+                        s_speaker_codec_fmt = fs;
+                        s_speaker_codec_open = true;
                         ESP_LOGI(TAG, "MP3 decode info: %u Hz, %u-bit, %u ch",
                                  (unsigned)dec_info.sample_rate,
                                  (unsigned)dec_info.bits_per_sample,
@@ -1637,9 +1654,6 @@ static void play_image_sound(size_t img_idx)
             offset += chunk;
         }
 
-        if (codec_opened) {
-            esp_codec_dev_close(s_speaker_codec_dev);
-        }
         esp_audio_simple_dec_close(decoder);
         free(out_buf);
 
