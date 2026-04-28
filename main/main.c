@@ -11,6 +11,7 @@
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_vfs_fat.h"
 #include "bsp/esp-bsp.h"
 #include "bsp/display.h"
@@ -21,6 +22,8 @@
 #include "esp_audio_simple_dec_default.h"
 #include "lvgl.h"
 #include "draw/lv_image_decoder_private.h"
+
+#include "axp2101_pmu.h"
 
 // Core slideshow limits and timing.
 #define MAX_IMAGES 256                         // Maximum number of image entries to index from SD root.
@@ -55,6 +58,10 @@
 // Audio task/runtime settings.
 #define AUDIO_PLAYBACK_TASK_STACK_SIZE 16384  // Stack size (bytes) for asynchronous audio playback task.
 #define AUDIO_OUTPUT_VOLUME_PERCENT 85        // Speaker output gain percentage sent to codec.
+#define EDGE_SWIPE_ZONE_PX 90                 // Edge zone used to qualify top/bottom swipe gestures.
+#define EDGE_SWIPE_TRIGGER_PX 100             // Minimum vertical travel (pixels) to accept swipe.
+#define AUDIO_TOUCH_DEAD_ZONE_BOTTOM_PX 110   // Bottom area where touch will not trigger audio playback.
+#define BATTERY_STATUS_PAGE_COUNT 3           // Number of swipeable pages in battery status view.
 
 static const char *TAG = "SLIDESHOW";
 
@@ -74,9 +81,13 @@ typedef struct {
 } image_entry_t;
 
 static lv_obj_t *s_screen_obj; // Root screen object used for backdrop color updates.
+static lv_obj_t *s_battery_screen_obj; // Dedicated battery status page.
 static lv_obj_t *s_image_objs[2]; // Double-buffered LVGL image widgets for flip-style swaps.
 static uint8_t s_active_image_obj_idx = 0; // Index of currently visible image object.
 static lv_obj_t *s_status_label; // Footer label showing index/name/decode status.
+static lv_obj_t *s_battery_status_label; // Multi-line battery diagnostics label.
+static lv_obj_t *s_battery_title_label; // Title row with battery page index.
+static lv_obj_t *s_battery_hint_label; // Footer hint for paging/navigation gestures.
 static image_entry_t s_images[MAX_IMAGES];
 static size_t s_image_count;
 static size_t s_current_index;
@@ -88,6 +99,328 @@ static bool s_audio_playing = false;
 static TickType_t s_last_touch_tick = 0;
 static TaskHandle_t s_audio_task_handle = NULL; // Worker task that performs decode/write off UI callback.
 static size_t s_pending_audio_index = SIZE_MAX; // Slide index queued for next touch-triggered playback.
+static bool s_on_battery_page = false; // True while battery status page is active.
+static lv_point_t s_touch_start_point = {0}; // Initial touch point captured on press.
+static bool s_touch_start_valid = false;
+static lv_point_t s_last_touch_down_point = {0}; // Last touch-down point on slideshow page.
+static bool s_last_touch_down_valid = false;
+static uint8_t s_battery_page_idx = 0;
+
+static uint32_t ui_get_vertical_res(void)
+{
+#if LVGL_VERSION_MAJOR >= 9
+    lv_display_t *display = lv_display_get_default();
+    if (display == NULL) {
+        return 0;
+    }
+    return (uint32_t)lv_display_get_vertical_resolution(display);
+#else
+    lv_disp_t *display = lv_disp_get_default();
+    if (display == NULL) {
+        return 0;
+    }
+    return (uint32_t)lv_disp_get_ver_res(display);
+#endif
+}
+
+static void ui_load_screen(lv_obj_t *screen)
+{
+    if (screen == NULL) {
+        return;
+    }
+#if LVGL_VERSION_MAJOR >= 9
+    lv_screen_load(screen);
+#else
+    lv_scr_load(screen);
+#endif
+}
+
+static void ui_load_screen_with_masked_brightness(lv_obj_t *screen)
+{
+    if (screen == NULL) {
+        return;
+    }
+
+    const int normal_brightness = 100;
+    esp_err_t err = bsp_display_brightness_set(0);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to blank display before screen switch: %s", esp_err_to_name(err));
+    }
+
+    bsp_display_lock(portMAX_DELAY);
+    ui_load_screen(screen);
+#if LVGL_VERSION_MAJOR >= 9
+    lv_display_t *display = lv_display_get_default();
+#else
+    lv_disp_t *display = lv_disp_get_default();
+#endif
+    if (display != NULL) {
+        lv_refr_now(display);
+    }
+    bsp_display_unlock();
+
+    err = bsp_display_brightness_set(normal_brightness);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to restore display brightness after screen switch: %s", esp_err_to_name(err));
+    }
+}
+
+static void update_battery_status_page(void)
+{
+    if (s_battery_status_label == NULL) {
+        return;
+    }
+
+    uint32_t uptime_s = esp_log_timestamp() / 1000;
+    uint32_t uptime_h = uptime_s / 3600;
+    uint32_t uptime_m = (uptime_s % 3600) / 60;
+    uint32_t uptime_sec = uptime_s % 60;
+
+    uint32_t heap_total = (uint32_t)heap_caps_get_total_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    uint32_t heap_free = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    uint32_t heap_largest = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    uint32_t psram_total = (uint32_t)heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+    uint32_t psram_free = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    uint32_t psram_largest = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+
+    bool has_images = (s_image_count > 0);
+    const char *slide_name = has_images ? s_images[s_current_index].file_name : "none";
+    const char *image_storage_mode = (has_images && s_images[s_current_index].file_data != NULL) ? "RAM/PSRAM preload" : "File-backed";
+
+    axp2101_pmu_telemetry_t pmu = {0};
+    esp_err_t pmu_err = axp2101_pmu_read(&pmu);
+    bool pmu_ok = (pmu_err == ESP_OK && pmu.chip_online);
+
+    const char *battery_connected_text = "unavailable";
+    const char *battery_percent_text = "unavailable";
+    const char *battery_voltage_text = "unavailable";
+    const char *charge_state_text = "unavailable";
+    const char *vbus_in_text = "unavailable";
+    const char *vbus_good_text = "unavailable";
+
+    char battery_percent_buf[16];
+    char battery_voltage_buf[24];
+
+    if (pmu_ok) {
+        battery_connected_text = pmu.battery_connected ? "yes" : "no";
+        vbus_in_text = pmu.vbus_in ? "yes" : "no";
+        vbus_good_text = pmu.vbus_good ? "yes" : "no";
+        charge_state_text = axp2101_charge_state_to_string(pmu.charge_state);
+
+        if (pmu.battery_percent >= 0) {
+            snprintf(battery_percent_buf, sizeof(battery_percent_buf), "%d%%", pmu.battery_percent);
+            battery_percent_text = battery_percent_buf;
+        }
+
+        if (pmu.battery_voltage_mv >= 0) {
+            snprintf(battery_voltage_buf, sizeof(battery_voltage_buf), "%d mV", pmu.battery_voltage_mv);
+            battery_voltage_text = battery_voltage_buf;
+        }
+    }
+
+    char title[64];
+    snprintf(title, sizeof(title), "Status %u/%u",
+             (unsigned)(s_battery_page_idx + 1),
+             (unsigned)BATTERY_STATUS_PAGE_COUNT);
+    if (s_battery_title_label != NULL) {
+        lv_label_set_text(s_battery_title_label, title);
+    }
+
+    if (s_battery_hint_label != NULL) {
+        if (s_battery_page_idx == 0) {
+            lv_label_set_text(s_battery_hint_label, "Swipe up: next page\nSwipe down: slideshow");
+        } else if (s_battery_page_idx + 1 >= BATTERY_STATUS_PAGE_COUNT) {
+            lv_label_set_text(s_battery_hint_label, "Swipe down:\nprevious page");
+        } else {
+            lv_label_set_text(s_battery_hint_label, "Swipe up: next page\nSwipe down: previous page");
+        }
+    }
+
+    char status[768];
+    if (s_battery_page_idx == 0) {
+        snprintf(status, sizeof(status),
+                 "Power Overview\n"
+                 "\n"
+                 "Uptime: %02u:%02u:%02u\n"
+                 "PMU comms: %s\n"
+                 "Battery connected: %s\n"
+                 "Battery percent: %s\n"
+                 "Battery voltage: %s\n"
+                 "Charge state: %s\n"
+                 "VBUS present: %s\n"
+                 "VBUS good: %s",
+                 (unsigned)uptime_h,
+                 (unsigned)uptime_m,
+                 (unsigned)uptime_sec,
+                 pmu_ok ? "ok" : esp_err_to_name(pmu_err),
+                 battery_connected_text,
+                 battery_percent_text,
+                 battery_voltage_text,
+                 charge_state_text,
+                 vbus_in_text,
+                 vbus_good_text);
+    } else if (s_battery_page_idx == 1) {
+        snprintf(status, sizeof(status),
+                 "Slide & Audio\n"
+                 "\n"
+                 "Current slide: %u/%u\n"
+                 "File: %s\n"
+                 "Image source: %s\n"
+                 "SD mounted: %s\n"
+                 "Audio initialized: %s\n"
+                 "Audio active: %s\n"
+                 "Raw STATUS1: 0x%02X\n"
+                 "Raw STATUS2: 0x%02X",
+                 (unsigned)(has_images ? (s_current_index + 1) : 0),
+                 (unsigned)s_image_count,
+                 slide_name,
+                 image_storage_mode,
+                 s_sdcard != NULL ? "yes" : "no",
+                 s_audio_initialized ? "yes" : "no",
+                 s_audio_playing ? "yes" : "no",
+                 (unsigned)pmu.raw_status1,
+                 (unsigned)pmu.raw_status2);
+    } else {
+        snprintf(status, sizeof(status),
+                 "Memory\n"
+                 "\n"
+                 "Heap free: %u\n"
+                 "Heap largest: %u\n"
+                 "Heap total: %u\n"
+                 "PSRAM free: %u\n"
+                 "PSRAM largest: %u\n"
+                 "PSRAM total: %u",
+                 (unsigned)heap_free,
+                 (unsigned)heap_largest,
+                 (unsigned)heap_total,
+                 (unsigned)psram_free,
+                 (unsigned)psram_largest,
+                 (unsigned)psram_total);
+    }
+    lv_label_set_text(s_battery_status_label, status);
+}
+
+static void show_battery_page(void)
+{
+    if (s_battery_screen_obj == NULL || s_on_battery_page) {
+        return;
+    }
+
+    s_battery_page_idx = 0;
+    update_battery_status_page();
+    ui_load_screen_with_masked_brightness(s_battery_screen_obj);
+    s_on_battery_page = true;
+}
+
+static void show_slideshow_page(void)
+{
+    if (s_screen_obj == NULL || !s_on_battery_page) {
+        return;
+    }
+
+    ui_load_screen_with_masked_brightness(s_screen_obj);
+    s_on_battery_page = false;
+}
+
+static void capture_touch_start(lv_event_t *event)
+{
+    lv_indev_t *indev = lv_event_get_indev(event);
+    if (indev == NULL) {
+        s_touch_start_valid = false;
+        s_last_touch_down_valid = false;
+        return;
+    }
+    lv_indev_get_point(indev, &s_touch_start_point);
+    s_touch_start_valid = true;
+    s_last_touch_down_point = s_touch_start_point;
+    s_last_touch_down_valid = true;
+}
+
+static bool detect_bottom_to_top_swipe(lv_event_t *event)
+{
+    if (!s_touch_start_valid) {
+        return false;
+    }
+
+    lv_indev_t *indev = lv_event_get_indev(event);
+    if (indev == NULL) {
+        return false;
+    }
+
+    lv_point_t end_point;
+    lv_indev_get_point(indev, &end_point);
+
+    uint32_t height = ui_get_vertical_res();
+    if (height == 0 || height < EDGE_SWIPE_ZONE_PX) {
+        return false;
+    }
+
+    int32_t dy = end_point.y - s_touch_start_point.y;
+    return (s_touch_start_point.y >= (int32_t)(height - EDGE_SWIPE_ZONE_PX)) &&
+           (dy <= -(int32_t)EDGE_SWIPE_TRIGGER_PX);
+}
+
+static bool detect_top_to_bottom_swipe(lv_event_t *event)
+{
+    if (!s_touch_start_valid) {
+        return false;
+    }
+
+    lv_indev_t *indev = lv_event_get_indev(event);
+    if (indev == NULL) {
+        return false;
+    }
+
+    lv_point_t end_point;
+    lv_indev_get_point(indev, &end_point);
+
+    int32_t dy = end_point.y - s_touch_start_point.y;
+    return (s_touch_start_point.y <= (int32_t)EDGE_SWIPE_ZONE_PX) &&
+           (dy >= (int32_t)EDGE_SWIPE_TRIGGER_PX);
+}
+
+static void on_slideshow_nav_event(lv_event_t *event)
+{
+    if (event == NULL) return;
+
+    lv_event_code_t code = lv_event_get_code(event);
+    if (code == LV_EVENT_PRESSED) {
+        capture_touch_start(event);
+    } else if (code == LV_EVENT_RELEASED) {
+        if (detect_bottom_to_top_swipe(event)) {
+            show_battery_page();
+        }
+        s_touch_start_valid = false;
+    }
+}
+
+static void on_battery_nav_event(lv_event_t *event)
+{
+    if (event == NULL) return;
+
+    lv_event_code_t code = lv_event_get_code(event);
+    if (code == LV_EVENT_PRESSED) {
+        capture_touch_start(event);
+    } else if (code == LV_EVENT_RELEASED) {
+        bool swipe_up = detect_bottom_to_top_swipe(event);
+        bool swipe_down = detect_top_to_bottom_swipe(event);
+
+        if (swipe_up) {
+            if (s_battery_page_idx + 1 < BATTERY_STATUS_PAGE_COUNT) {
+                s_battery_page_idx++;
+                update_battery_status_page();
+            }
+        } else if (swipe_down) {
+            if (s_battery_page_idx > 0) {
+                s_battery_page_idx--;
+                update_battery_status_page();
+            } else {
+                show_slideshow_page();
+            }
+        }
+        s_touch_start_valid = false;
+    }
+}
 
 /**
  * Mount the SD card using stable 1-bit SDMMC settings for this board.
@@ -1418,6 +1751,14 @@ static void on_image_touched(lv_event_t *event)
 
     lv_event_code_t code = lv_event_get_code(event);
     if (code == LV_EVENT_CLICKED) {
+        uint32_t height = ui_get_vertical_res();
+        if (height > AUDIO_TOUCH_DEAD_ZONE_BOTTOM_PX && s_last_touch_down_valid) {
+            if (s_last_touch_down_point.y >= (int32_t)(height - AUDIO_TOUCH_DEAD_ZONE_BOTTOM_PX)) {
+                // Reserve bottom edge for navigation gestures without triggering slide audio.
+                return;
+            }
+        }
+
         TickType_t now = xTaskGetTickCount();
         // Debounce touch noise and rapid taps to avoid overlapping playbacks.
         if ((now - s_last_touch_tick) < pdMS_TO_TICKS(TOUCH_DEBOUNCE_MS)) {
@@ -1490,6 +1831,13 @@ static void slideshow_task(void *arg)
     ESP_ERROR_CHECK(bsp_display_backlight_on());
     ESP_ERROR_CHECK(bsp_display_brightness_set(100));
 
+    esp_err_t pmu_init_err = axp2101_pmu_init();
+    if (pmu_init_err == ESP_OK) {
+        ESP_LOGI(TAG, "AXP2101 PMU telemetry initialized");
+    } else {
+        ESP_LOGW(TAG, "AXP2101 PMU telemetry unavailable: %s", esp_err_to_name(pmu_init_err));
+    }
+
     log_startup_memory_health();
 
     ESP_ERROR_CHECK(mount_sdcard_with_retries());
@@ -1521,6 +1869,8 @@ static void slideshow_task(void *arg)
     lv_obj_set_style_bg_opa(s_screen_obj, LV_OPA_COVER, 0);
     lv_obj_add_flag(s_screen_obj, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_screen_obj, on_image_touched, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(s_screen_obj, on_slideshow_nav_event, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(s_screen_obj, on_slideshow_nav_event, LV_EVENT_RELEASED, NULL);
 
     s_image_objs[0] = lv_image_create(s_screen_obj);
     lv_image_set_antialias(s_image_objs[0], false);
@@ -1539,24 +1889,79 @@ static void slideshow_task(void *arg)
     lv_label_set_long_mode(s_status_label, LV_LABEL_LONG_CLIP);
     lv_obj_set_style_text_color(s_status_label, lv_color_hex(0xD0D0D0), 0);
     lv_obj_align(s_status_label, LV_ALIGN_TOP_MID, 0, 10);
+    lv_obj_add_flag(s_status_label, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    s_battery_screen_obj = lv_obj_create(NULL);
+    lv_obj_clear_flag(s_battery_screen_obj, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(s_battery_screen_obj, lv_color_hex(0x0A1420), 0);
+    lv_obj_set_style_bg_opa(s_battery_screen_obj, LV_OPA_COVER, 0);
+    lv_obj_add_flag(s_battery_screen_obj, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_battery_screen_obj, on_battery_nav_event, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(s_battery_screen_obj, on_battery_nav_event, LV_EVENT_RELEASED, NULL);
+
+    s_battery_title_label = lv_label_create(s_battery_screen_obj);
+    lv_label_set_text(s_battery_title_label, "Battery Status");
+    lv_obj_set_style_text_color(s_battery_title_label, lv_color_hex(0xE8F4FF), 0);
+    lv_obj_align(s_battery_title_label, LV_ALIGN_TOP_MID, 0, 20);
+    lv_obj_add_flag(s_battery_title_label, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    s_battery_status_label = lv_label_create(s_battery_screen_obj);
+    lv_obj_set_width(s_battery_status_label, lv_pct(68));
+    lv_label_set_long_mode(s_battery_status_label, LV_LABEL_LONG_WRAP);
+#if LV_FONT_MONTSERRAT_30
+    lv_obj_set_style_text_font(s_battery_status_label, &lv_font_montserrat_30, 0);
+#elif LV_FONT_MONTSERRAT_28
+    lv_obj_set_style_text_font(s_battery_status_label, &lv_font_montserrat_28, 0);
+#elif LV_FONT_MONTSERRAT_24
+    lv_obj_set_style_text_font(s_battery_status_label, &lv_font_montserrat_24, 0);
+#elif LV_FONT_MONTSERRAT_20
+    lv_obj_set_style_text_font(s_battery_status_label, &lv_font_montserrat_20, 0);
+#endif
+    lv_obj_set_style_text_color(s_battery_status_label, lv_color_hex(0xC6D8E8), 0);
+    lv_obj_set_style_text_line_space(s_battery_status_label, 3, 0);
+    lv_obj_align(s_battery_status_label, LV_ALIGN_TOP_MID, 0, 74);
+    lv_obj_add_flag(s_battery_status_label, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    s_battery_hint_label = lv_label_create(s_battery_screen_obj);
+    lv_label_set_text(s_battery_hint_label, "Swipe for pages");
+    lv_obj_set_width(s_battery_hint_label, lv_pct(72));
+    lv_label_set_long_mode(s_battery_hint_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(s_battery_hint_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(s_battery_hint_label, lv_color_hex(0x90A4B5), 0);
+    lv_obj_align(s_battery_hint_label, LV_ALIGN_BOTTOM_MID, 0, -20);
+    lv_obj_add_flag(s_battery_hint_label, LV_OBJ_FLAG_EVENT_BUBBLE);
 
     update_image_and_status(0);
+    update_battery_status_page();
     // Keep first frame path simple while screen is already locked here.
     bsp_display_unlock();
 
     uint32_t elapsed_ms = 0;
+    uint32_t battery_refresh_ms = 0;
     while (1) {
         UBaseType_t stack_words_free = uxTaskGetStackHighWaterMark(NULL);
         if (stack_words_free < 512) {
             ESP_LOGW(TAG, "Low slideshow stack watermark: %u words", (unsigned)stack_words_free);
         }
 
-        // Tick slideshow at 1 Hz and advance when configured interval is reached.
-        if (s_image_count > 1) {
-            elapsed_ms += 1000;
-            if (elapsed_ms >= IMAGE_CHANGE_MS) {
-                elapsed_ms = 0;
-                update_image_with_masked_brightness(display, (s_current_index + 1) % s_image_count);
+        if (!s_on_battery_page) {
+            battery_refresh_ms = 0;
+            // Tick slideshow at 1 Hz and advance when configured interval is reached.
+            if (s_image_count > 1) {
+                elapsed_ms += 1000;
+                if (elapsed_ms >= IMAGE_CHANGE_MS) {
+                    elapsed_ms = 0;
+                    update_image_with_masked_brightness(display, (s_current_index + 1) % s_image_count);
+                }
+            }
+        } else {
+            elapsed_ms = 0;
+            battery_refresh_ms += 1000;
+            if (battery_refresh_ms >= 1000) {
+                battery_refresh_ms = 0;
+                bsp_display_lock(portMAX_DELAY);
+                update_battery_status_page();
+                bsp_display_unlock();
             }
         }
 
